@@ -1,0 +1,1310 @@
+import React, {
+  useState,
+  useEffect,
+  useCallback,
+  useMemo,
+} from "react";
+
+import { initializeApp } from "firebase/app";
+import { getFirestore } from "firebase/firestore";
+const firebaseConfig = {
+  apiKey: "AIzaSyDojfqEJsOeOyPBHS_apHUo9WRCdsQnkNI",
+  authDomain: "football-pool-93b96.firebaseapp.com",
+  databaseURL: "https://football-pool-93b96-default-rtdb.firebaseio.com",
+  projectId: "football-pool-93b96",
+  storageBucket: "football-pool-93b96.firebasestorage.app",
+  messagingSenderId: "966905597265",
+  appId: "1:966905597265:web:33d83ceec5e41082ae1770",
+};
+
+const firebaseApp = initializeApp(firebaseConfig);
+const db = getFirestore(firebaseApp);
+const FIREBASE_CONFIGURED = true;
+
+const DEFAULT_PLAYERS = [
+  "Eric", "DaBum", "Larry B", "Mike H", "Mom", "Big Dawg", "The Champ",
+  "SIS", "Bones", "Baby Shark", "Baltimore", "Coach", "Butters",
+  "Church", "Tmelt", "Tom",
+];
+
+const TOTAL_WEEKS = 18;
+const emptyGame = () => ({ away: "", home: "" });
+
+// ---- Storage: shared (Firestore, synced across everyone) vs
+// ---- private (localStorage, this device only — used for admin unlock state)
+function useStorage() {
+  const get = useCallback(async (key, shared = true) => {
+    try {
+      if (!shared) {
+        const raw = localStorage.getItem("pool:" + key);
+        return raw ? JSON.parse(raw) : null;
+      }
+      if (!db) return null;
+      const snap = await db.collection("poolData").doc(key).get();
+      return snap.exists ? JSON.parse(snap.data().value) : null;
+    } catch {
+      return null;
+    }
+  }, []);
+
+  const set = useCallback(async (key, value, shared = true) => {
+    try {
+      if (!shared) {
+        localStorage.setItem("pool:" + key, JSON.stringify(value));
+        return true;
+      }
+      if (!db) return false;
+      await db.collection("poolData").doc(key).set({ value: JSON.stringify(value) });
+      return true;
+    } catch {
+      return false;
+    }
+  }, []);
+
+  const del = useCallback(async (key, shared = true) => {
+    try {
+      if (!shared) {
+        localStorage.removeItem("pool:" + key);
+        return true;
+      }
+      if (!db) return false;
+      await db.collection("poolData").doc(key).delete();
+      return true;
+    } catch {
+      return false;
+    }
+  }, []);
+
+  const list = useCallback(async (prefix, shared = true) => {
+    try {
+      if (!shared) {
+        return Object.keys(localStorage)
+          .filter((k) => k.startsWith("pool:" + (prefix || "")))
+          .map((k) => k.slice(5));
+      }
+      if (!db) return [];
+      const snap = await db.collection("poolData").get();
+      return snap.docs.map((d) => d.id).filter((id) => !prefix || id.startsWith(prefix));
+    } catch {
+      return [];
+    }
+  }, []);
+
+  return { get, set, list, del };
+}
+
+function weekKey(w) { return `week-config:${w}`; }
+function picksKey(w, p) { return `picks:${w}:${p}`; }
+
+function getMnfIndices(config) {
+  if (!config) return [];
+  if (Array.isArray(config.mnfIndices)) return config.mnfIndices;
+  if (config.mnfIndex != null) return [config.mnfIndex];
+  return [];
+}
+
+function getThuIndices(config) {
+  if (!config || !Array.isArray(config.thuIndices)) return [];
+  return config.thuIndices;
+}
+
+function isGameLocked(config, i) {
+  if (!config) return false;
+  if (config.locked) return true;
+  const isThu = getThuIndices(config).includes(i);
+  const deadline = isThu ? config.thuDeadline : config.mainDeadline;
+  if (!deadline) return false;
+  return new Date() >= new Date(deadline);
+}
+
+function isWeekRevealed(config) {
+  if (!config) return false;
+  if (config.locked) return true;
+  if (!config.mainDeadline) return false;
+  return new Date() >= new Date(config.mainDeadline);
+}
+
+async function fetchWeekFromESPN(week, year, seasonType) {
+  const url = `https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard?seasontype=${seasonType}&week=${week}&dates=${year}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`ESPN returned ${res.status}`);
+  const data = await res.json();
+  const events = [...(data.events || [])].sort((a, b) => new Date(a.date) - new Date(b.date));
+  if (events.length === 0) throw new Error("No games found for that week/year yet");
+
+  const games = [];
+  const results = [];
+  const mnfIndices = [];
+  const thuIndices = [];
+
+  events.forEach((ev, i) => {
+    const comp = ev.competitions[0];
+    const home = comp.competitors.find((c) => c.homeAway === "home");
+    const away = comp.competitors.find((c) => c.homeAway === "away");
+    games.push({ away: away.team.abbreviation, home: home.team.abbreviation });
+    const completed = comp.status?.type?.completed;
+    if (completed) {
+      const winner = comp.competitors.find((c) => c.winner);
+      results.push(winner ? winner.team.abbreviation : "");
+    } else {
+      results.push("");
+    }
+    const etDay = new Date(new Date(ev.date).toLocaleString("en-US", { timeZone: "America/New_York" })).getDay();
+    if (etDay === 1) mnfIndices.push(i);
+    if (etDay === 4) thuIndices.push(i);
+  });
+
+  let mnfActual = null;
+  if (mnfIndices.length > 0) {
+    const allDone = mnfIndices.every((i) => events[i].competitions[0].status?.type?.completed);
+    if (allDone) {
+      mnfActual = mnfIndices.reduce((sum, i) => {
+        const comp = events[i].competitions[0];
+        return sum + comp.competitors.reduce((s, c) => s + Number(c.score || 0), 0);
+      }, 0);
+    }
+  }
+
+  return { games, results, mnfIndices, thuIndices, mnfActual };
+}
+
+function tiebreak(candidates, mnfGuesses, mnfActual) {
+  if (candidates.length <= 1 || mnfActual == null) return candidates;
+  const withGuess = candidates.filter((c) => mnfGuesses[c] != null);
+  if (withGuess.length === 0) return candidates;
+  const notOver = withGuess.filter((c) => mnfGuesses[c] <= mnfActual);
+  const pool = notOver.length > 0 ? notOver : withGuess;
+  let best = -Infinity;
+  let winners = [];
+  pool.forEach((c) => {
+    const diff = notOver.length > 0
+      ? mnfActual - mnfGuesses[c]
+      : -Math.abs(mnfActual - mnfGuesses[c]);
+    if (diff > best) { best = diff; winners = [c]; }
+    else if (diff === best) { winners.push(c); }
+  });
+  return winners;
+}
+
+function computeWeekScores(config, picks, players) {
+  const scores = {};
+  players.forEach((p) => { scores[p] = 0; });
+  if (!config) return scores;
+  const results = config.results || [];
+  players.forEach((p) => {
+    const pk = picks[p];
+    if (!pk) return;
+    let total = 0;
+    pk.picks.forEach((sel, i) => {
+      if (!sel || !sel.team) return;
+      const winner = results[i];
+      if (winner && sel.team === winner) total += sel.points || 0;
+    });
+    scores[p] = total;
+  });
+  return scores;
+}
+
+function FootballPool() {
+  const { get, set, list, del } = useStorage();
+  const [players, setPlayers] = useState(DEFAULT_PLAYERS);
+  const [tab, setTab] = useState("picks");
+  const [week, setWeek] = useState(1);
+  const [config, setConfig] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [activePlayer, setActivePlayer] = useState("");
+  const [myPicks, setMyPicks] = useState(null);
+  const [saveState, setSaveState] = useState("idle");
+  const [allPicksThisWeek, setAllPicksThisWeek] = useState({});
+  const [seasonScores, setSeasonScores] = useState(null);
+  const [seasonLoading, setSeasonLoading] = useState(false);
+  const [weeklyBoard, setWeeklyBoard] = useState({});
+  const [seasonYear, setSeasonYear] = useState(() => {
+    const now = new Date();
+    return now.getMonth() >= 1 ? now.getFullYear() : now.getFullYear() - 1;
+  });
+  const [seasonType, setSeasonType] = useState(() => (new Date().getMonth() >= 8 ? 2 : 1));
+  const [adminPin, setAdminPinState] = useState(null);
+  const [isAdmin, setIsAdmin] = useState(false);
+  const [showPinPrompt, setShowPinPrompt] = useState(false);
+  const [pinInput, setPinInput] = useState("");
+  const [pinError, setPinError] = useState("");
+  const [weekLabels, setWeekLabels] = useState({});
+
+  useEffect(() => {
+    (async () => {
+      const p = await get("players");
+      if (p) setPlayers(p);
+      const y = await get("season-year");
+      if (y) setSeasonYear(y);
+      const st = await get("season-type");
+      if (st) setSeasonType(st);
+      const pin = await get("admin-pin");
+      if (pin) setAdminPinState(pin);
+      const unlocked = await get("admin-unlocked", false);
+      if (unlocked) setIsAdmin(true);
+      const labels = {};
+      for (let w = 1; w <= TOTAL_WEEKS; w++) {
+        const c = await get(weekKey(w));
+        if (c && c.label) labels[w] = c.label;
+      }
+      setWeekLabels(labels);
+      setLoading(false);
+    })();
+  }, [get]);
+
+  const handlePinSubmit = async () => {
+    const trimmed = pinInput.trim();
+    if (!adminPin) {
+      if (trimmed.length < 3) { setPinError("Use at least 3 characters"); return; }
+      await set("admin-pin", trimmed);
+      setAdminPinState(trimmed);
+      setIsAdmin(true);
+      await set("admin-unlocked", true, false);
+      setShowPinPrompt(false);
+      setPinInput("");
+      setPinError("");
+    } else if (trimmed === adminPin) {
+      setIsAdmin(true);
+      await set("admin-unlocked", true, false);
+      setShowPinPrompt(false);
+      setPinInput("");
+      setPinError("");
+    } else {
+      setPinError("That's not it");
+    }
+  };
+
+  const handleAdminLogout = async () => {
+    setIsAdmin(false);
+    await set("admin-unlocked", false, false);
+    setTab("picks");
+  };
+
+  const loadWeek = useCallback(async (w) => {
+    const c = await get(weekKey(w));
+    setConfig(
+      c || {
+        games: Array.from({ length: 16 }, emptyGame),
+        mnfIndices: [],
+        thuIndices: [],
+        results: [],
+        mnfActual: null,
+        thuDeadline: null,
+        mainDeadline: null,
+        locked: false,
+        label: "",
+      }
+    );
+  }, [get]);
+
+  useEffect(() => { loadWeek(week); }, [week, loadWeek]);
+
+  useEffect(() => {
+    if (!activePlayer) { setMyPicks(null); return; }
+    (async () => {
+      const existing = await get(picksKey(week, activePlayer));
+      if (existing) setMyPicks(existing);
+      else setMyPicks({ picks: [], mnfGuess: "" });
+    })();
+  }, [activePlayer, week, get]);
+
+  const loadAllPicksThisWeek = useCallback(async () => {
+    const results = {};
+    for (const p of players) {
+      const pk = await get(picksKey(week, p));
+      if (pk) results[p] = pk;
+    }
+    setAllPicksThisWeek(results);
+  }, [players, week, get]);
+
+  useEffect(() => {
+    if (tab === "admin" && !isAdmin) setTab("picks");
+  }, [tab, isAdmin]);
+
+  useEffect(() => {
+    if (tab === "admin" || tab === "standings") loadAllPicksThisWeek();
+  }, [tab, week, loadAllPicksThisWeek]);
+
+  const loadSeason = useCallback(async () => {
+    setSeasonLoading(true);
+    const totals = {};
+    players.forEach((p) => { totals[p] = { total: 0, weeklyWins: 0, byWeek: {} }; });
+    const board = {};
+    for (let w = 1; w <= TOTAL_WEEKS; w++) {
+      const c = await get(weekKey(w));
+      if (!c || !c.results || c.results.filter(Boolean).length === 0) continue;
+      const picks = {};
+      for (const p of players) {
+        const pk = await get(picksKey(w, p));
+        if (pk) picks[p] = pk;
+      }
+      const scores = computeWeekScores(c, picks, players);
+      players.forEach((p) => {
+        totals[p].total += scores[p] || 0;
+        totals[p].byWeek[w] = scores[p] || 0;
+      });
+      const max = Math.max(...Object.values(scores));
+      let tied = players.filter((p) => scores[p] === max && max > 0);
+      if (tied.length > 1 && c.mnfActual != null) {
+        const guesses = {};
+        players.forEach((p) => {
+          if (picks[p]) guesses[p] = Number(picks[p].mnfGuess);
+        });
+        tied = tiebreak(tied, guesses, c.mnfActual);
+      }
+      tied.forEach((p) => { if (totals[p]) totals[p].weeklyWins += 1; });
+      board[w] = { scores, winners: tied };
+    }
+    setSeasonScores(totals);
+    setWeeklyBoard(board);
+    setSeasonLoading(false);
+  }, [players, get]);
+
+  useEffect(() => { if (tab === "standings") loadSeason(); }, [tab, loadSeason]);
+
+  const saveConfig = async (next) => {
+    setConfig(next);
+    await set(weekKey(week), next);
+    setWeekLabels((prev) => ({ ...prev, [week]: next.label || undefined }));
+  };
+
+  const clearWeek = async () => {
+    const blank = {
+      games: Array.from({ length: 16 }, emptyGame),
+      mnfIndices: [],
+      thuIndices: [],
+      results: [],
+      mnfActual: null,
+      thuDeadline: null,
+      mainDeadline: null,
+      locked: false,
+      label: "",
+    };
+    await set(weekKey(week), blank);
+    setConfig(blank);
+    setWeekLabels((prev) => { const next = { ...prev }; delete next[week]; return next; });
+    for (const p of players) {
+      await del(picksKey(week, p));
+    }
+    setAllPicksThisWeek({});
+  };
+
+  const savePicks = async () => {
+    setSaveState("saving");
+    await set(picksKey(week, activePlayer), myPicks);
+    setSaveState("saved");
+    setTimeout(() => setSaveState("idle"), 1500);
+  };
+
+  const weekScoresNow = useMemo(
+    () => computeWeekScores(config, allPicksThisWeek, players),
+    [config, allPicksThisWeek, players]
+  );
+
+  const weekWinners = useMemo(() => {
+    const vals = Object.values(weekScoresNow);
+    if (vals.length === 0) return [];
+    const max = Math.max(...vals);
+    if (max <= 0) return [];
+    let tied = players.filter((p) => weekScoresNow[p] === max);
+    if (tied.length > 1 && config && config.mnfActual != null) {
+      const guesses = {};
+      players.forEach((p) => {
+        if (allPicksThisWeek[p]) guesses[p] = Number(allPicksThisWeek[p].mnfGuess);
+      });
+      tied = tiebreak(tied, guesses, config.mnfActual);
+    }
+    return tied;
+  }, [weekScoresNow, players, config, allPicksThisWeek]);
+
+  if (!FIREBASE_CONFIGURED) {
+    return (
+      <div className="min-h-screen bg-slate-950 text-slate-100 flex items-center justify-center px-4">
+        <div className="max-w-md bg-slate-900 border border-amber-700/40 rounded-lg p-6">
+          <h1 className="text-amber-400 font-bold text-lg mb-2">Firebase not configured yet</h1>
+          <p className="text-sm text-slate-400">
+            Open this file and fill in the <code className="text-amber-300">FIREBASE_CONFIG</code> object
+            near the top with your Firebase project's web config. Setup steps are in the comment right above it.
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  if (loading) {
+    return (
+      <div className="min-h-screen bg-slate-950 flex items-center justify-center">
+        <p className="text-amber-400 font-mono text-sm tracking-widest">LOADING POOL…</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen bg-slate-950 text-slate-100">
+      <Header
+        week={week}
+        setWeek={setWeek}
+        tab={tab}
+        setTab={setTab}
+        isAdmin={isAdmin}
+        adminPin={adminPin}
+        showPinPrompt={showPinPrompt}
+        setShowPinPrompt={setShowPinPrompt}
+        pinInput={pinInput}
+        setPinInput={setPinInput}
+        pinError={pinError}
+        handlePinSubmit={handlePinSubmit}
+        handleAdminLogout={handleAdminLogout}
+        weekLabels={weekLabels}
+      />
+      <main className="max-w-3xl mx-auto px-4 pb-24 pt-6">
+        {tab === "picks" && (
+          <PicksTab
+            players={players}
+            activePlayer={activePlayer}
+            setActivePlayer={setActivePlayer}
+            config={config}
+            myPicks={myPicks}
+            setMyPicks={setMyPicks}
+            savePicks={savePicks}
+            saveState={saveState}
+            week={week}
+          />
+        )}
+        {tab === "admin" && (
+          <AdminTab
+            config={config}
+            saveConfig={saveConfig}
+            players={players}
+            setPlayers={(p) => { setPlayers(p); set("players", p); }}
+            allPicksThisWeek={allPicksThisWeek}
+            weekScoresNow={weekScoresNow}
+            weekWinners={weekWinners}
+            week={week}
+            seasonYear={seasonYear}
+            setSeasonYear={(y) => { setSeasonYear(y); set("season-year", y); }}
+            seasonType={seasonType}
+            setSeasonType={(t) => { setSeasonType(t); set("season-type", t); }}
+            clearWeek={clearWeek}
+          />
+        )}
+        {tab === "standings" && (
+          <StandingsTab
+            seasonScores={seasonScores}
+            loading={seasonLoading}
+            players={players}
+            weeklyBoard={weeklyBoard}
+          />
+        )}
+      </main>
+    </div>
+  );
+}
+
+function Header({
+  week, setWeek, tab, setTab,
+  isAdmin, adminPin, showPinPrompt, setShowPinPrompt,
+  pinInput, setPinInput, pinError, handlePinSubmit, handleAdminLogout,
+  weekLabels,
+}) {
+  const navItems = [
+    ["picks", "Make Picks"],
+    ["standings", "Results"],
+  ];
+  if (isAdmin) navItems.push(["admin", "Admin"]);
+
+  return (
+    <div className="sticky top-0 z-10 bg-slate-950/95 backdrop-blur border-b border-slate-800">
+      <div className="max-w-3xl mx-auto px-4 pt-5">
+        <div className="flex items-baseline justify-between">
+          <h1 className="font-black text-2xl tracking-tight text-amber-400" style={{ fontFamily: "'Archivo Black', 'Arial Black', sans-serif" }}>
+            THE TAKE OVER
+          </h1>
+          <span className="text-[10px] font-mono uppercase tracking-[0.2em] text-slate-500">
+            family pool
+          </span>
+        </div>
+        <div className="flex items-center gap-2 mt-4">
+          <label className="text-xs font-mono text-slate-500 uppercase tracking-wide">Week</label>
+          <select
+            value={week}
+            onChange={(e) => setWeek(Number(e.target.value))}
+            className="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-sm font-mono text-amber-300"
+          >
+            {Array.from({ length: TOTAL_WEEKS }, (_, i) => i + 1).map((w) => (
+              <option key={w} value={w}>
+                Week {w}{weekLabels && weekLabels[w] ? ` — ${weekLabels[w]}` : ""}
+              </option>
+            ))}
+          </select>
+
+          <div className="ml-auto">
+            {isAdmin ? (
+              <button
+                onClick={handleAdminLogout}
+                className="text-[10px] font-mono text-emerald-400 hover:text-emerald-300"
+              >
+                commissioner ✓ — log out
+              </button>
+            ) : (
+              <button
+                onClick={() => setShowPinPrompt((v) => !v)}
+                className="text-[10px] font-mono text-slate-600 hover:text-slate-400"
+              >
+                commissioner
+              </button>
+            )}
+          </div>
+        </div>
+
+        {showPinPrompt && !isAdmin && (
+          <div className="mt-3 bg-slate-900 border border-slate-800 rounded-lg p-3">
+            <p className="text-[11px] text-slate-500 mb-2">
+              {adminPin ? "Enter the commissioner PIN" : "Set a commissioner PIN — you'll be the only one who can edit games, sync results, and lock weeks."}
+            </p>
+            <div className="flex gap-2">
+              <input
+                type="password"
+                value={pinInput}
+                onChange={(e) => { setPinInput(e.target.value); }}
+                onKeyDown={(e) => { if (e.key === "Enter") handlePinSubmit(); }}
+                placeholder={adminPin ? "PIN" : "Choose a PIN"}
+                className="flex-1 bg-slate-950 border border-slate-700 rounded px-3 py-1.5 text-sm font-mono"
+                autoFocus
+              />
+              <button
+                onClick={handlePinSubmit}
+                className="bg-amber-400 text-slate-950 font-bold text-xs px-3 py-1.5 rounded"
+              >
+                {adminPin ? "Unlock" : "Set PIN"}
+              </button>
+            </div>
+            {pinError && <p className="text-red-400 text-[11px] mt-1">{pinError}</p>}
+          </div>
+        )}
+
+        <nav className="flex gap-1 mt-4">
+          {navItems.map(([id, label]) => (
+            <button
+              key={id}
+              onClick={() => setTab(id)}
+              className={`px-3 py-2 text-sm font-semibold rounded-t-md border-b-2 transition-colors ${
+                tab === id
+                  ? "border-amber-400 text-amber-400"
+                  : "border-transparent text-slate-500 hover:text-slate-300"
+              }`}
+            >
+              {label}
+            </button>
+          ))}
+        </nav>
+      </div>
+    </div>
+  );
+}
+
+function PicksTab({ players, activePlayer, setActivePlayer, config, myPicks, setMyPicks, savePicks, saveState, week }) {
+  if (!activePlayer) {
+    return (
+      <div className="mt-8">
+        <p className="text-slate-400 text-sm mb-4">Who's picking?</p>
+        <div className="grid grid-cols-2 gap-2">
+          {players.map((p) => (
+            <button
+              key={p}
+              onClick={() => setActivePlayer(p)}
+              className="bg-slate-900 border border-slate-800 rounded-lg py-3 px-3 text-left hover:border-amber-500/50 transition-colors"
+            >
+              <span className="font-semibold">{p}</span>
+            </button>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  if (!myPicks) return <p className="text-slate-500 mt-8">Loading…</p>;
+
+  const games = (config && config.games) || [];
+  const mainLocked = !!(config && (config.locked || (config.mainDeadline && new Date() >= new Date(config.mainDeadline))));
+
+  const setSel = (i, field, value) => {
+    const next = { ...myPicks, picks: [...myPicks.picks] };
+    next.picks[i] = { ...(next.picks[i] || {}), [field]: value };
+    setMyPicks(next);
+  };
+
+  const filledCount = myPicks.picks.filter((s) => s && s.team && s.points).length;
+  const validGames = games.filter((g) => g.away && g.home).length;
+  const pointChoices = Array.from({ length: validGames }, (_, i) => i + 1);
+
+  const availablePointsFor = (i) => {
+    const usedElsewhere = new Set(
+      myPicks.picks
+        .map((s, idx) => (idx !== i && s && s.points ? s.points : null))
+        .filter((v) => v != null)
+    );
+    return pointChoices.filter((pt) => !usedElsewhere.has(pt));
+  };
+
+  const fmtDeadline = (iso) =>
+    iso ? new Date(iso).toLocaleString(undefined, { weekday: "short", hour: "numeric", minute: "2-digit" }) : null;
+
+  return (
+    <div className="mt-6">
+      <div className="flex items-center justify-between mb-4">
+        <button onClick={() => setActivePlayer("")} className="text-xs text-slate-500 hover:text-slate-300">
+          ← switch player
+        </button>
+        <span className="font-bold text-amber-400">{activePlayer}</span>
+      </div>
+
+      {config && config.label && (
+        <div className="mb-4 inline-block bg-sky-900/30 border border-sky-700/50 text-sky-300 text-xs font-mono px-3 py-1.5 rounded-full">
+          {config.label}
+        </div>
+      )}
+
+      {validGames === 0 && (
+        <p className="text-slate-500 text-sm bg-slate-900 border border-slate-800 rounded-lg p-4">
+          Week {week}'s games haven't been set up yet. Check the Results tab or ask the commissioner.
+        </p>
+      )}
+
+      {mainLocked && (
+        <p className="text-amber-300 text-xs bg-amber-900/20 border border-amber-800/40 rounded px-3 py-2 mb-4">
+          Picks for this week are locked.
+        </p>
+      )}
+
+      {validGames > 0 && !mainLocked && (
+        <p className="text-slate-500 text-xs mb-4">
+          {validGames} games this week — use each confidence value from 1–{validGames} exactly once.
+          {config.thuDeadline && <> Thursday games lock {fmtDeadline(config.thuDeadline)}.</>}
+          {config.mainDeadline && <> Everything else locks {fmtDeadline(config.mainDeadline)}.</>}
+          {" "}Your picks stay private until the week is fully locked.
+        </p>
+      )}
+
+      <div className="space-y-3">
+        {games.map((g, i) => {
+          if (!g.away || !g.home) return null;
+          const sel = myPicks.picks[i] || {};
+          const isMnf = getMnfIndices(config).includes(i);
+          const isThu = getThuIndices(config).includes(i);
+          const gameLocked = isGameLocked(config, i);
+          return (
+            <div key={i} className="bg-slate-900 border border-slate-800 rounded-lg p-3">
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-sm font-mono text-slate-300">{g.away} @ {g.home}</span>
+                <div className="flex items-center gap-2">
+                  {isMnf && <span className="text-[10px] uppercase tracking-wide text-amber-400 font-semibold">MNF</span>}
+                  {isThu && <span className="text-[10px] uppercase tracking-wide text-sky-400 font-semibold">THU</span>}
+                  {gameLocked && <span className="text-[10px] uppercase tracking-wide text-slate-500 font-semibold">LOCKED</span>}
+                </div>
+              </div>
+              <div className="flex gap-2">
+                {[g.away, g.home].map((team) => (
+                  <button
+                    key={team}
+                    disabled={gameLocked}
+                    onClick={() => setSel(i, "team", team)}
+                    className={`flex-1 py-2 rounded text-sm font-semibold border transition-colors disabled:opacity-50 ${
+                      sel.team === team
+                        ? "bg-amber-400 text-slate-950 border-amber-400"
+                        : "bg-slate-950 border-slate-700 text-slate-300 hover:border-slate-500"
+                    }`}
+                  >
+                    {team}
+                  </button>
+                ))}
+              </div>
+              <div className="mt-2">
+                <select
+                  disabled={gameLocked}
+                  value={sel.points || ""}
+                  onChange={(e) => setSel(i, "points", e.target.value ? Number(e.target.value) : null)}
+                  className={`w-full py-1.5 px-2 rounded text-xs font-mono border transition-colors disabled:opacity-50 ${
+                    sel.points
+                      ? "bg-emerald-500 text-slate-950 border-emerald-500"
+                      : "bg-slate-950 border-slate-800 text-slate-400"
+                  }`}
+                >
+                  <option value="">confidence points…</option>
+                  {availablePointsFor(i).map((pt) => (
+                    <option key={pt} value={pt}>{pt} point{pt > 1 ? "s" : ""}</option>
+                  ))}
+                </select>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      {validGames > 0 && (
+        <div className="mt-5 bg-slate-900 border border-slate-800 rounded-lg p-3">
+          <label className="text-xs uppercase tracking-wide text-slate-500 font-mono">
+            Monday Night combined score guess
+          </label>
+          <input
+            type="number"
+            disabled={mainLocked}
+            value={myPicks.mnfGuess}
+            onChange={(e) => setMyPicks({ ...myPicks, mnfGuess: e.target.value })}
+            className="mt-1 w-full bg-slate-950 border border-slate-700 rounded px-3 py-2 text-sm font-mono disabled:opacity-50"
+            placeholder="e.g. 45"
+          />
+        </div>
+      )}
+
+      {validGames > 0 && (
+        <div className="sticky bottom-4 mt-6">
+          <button
+            onClick={savePicks}
+            disabled={mainLocked}
+            className="w-full bg-amber-400 disabled:bg-slate-700 disabled:text-slate-400 text-slate-950 font-bold py-3 rounded-lg shadow-lg shadow-amber-950/40 transition-colors"
+          >
+            {saveState === "saving" ? "Saving…" : saveState === "saved" ? "Saved ✓" : `Save picks (${filledCount}/${validGames})`}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function AdminTab({ config, saveConfig, players, setPlayers, allPicksThisWeek, weekScoresNow, weekWinners, week, seasonYear, setSeasonYear, seasonType, setSeasonType, clearWeek }) {
+  const [editPlayers, setEditPlayers] = useState(false);
+  const [playerText, setPlayerText] = useState(players.join("\n"));
+  const [syncStatus, setSyncStatus] = useState("idle");
+  const [syncError, setSyncError] = useState(null);
+  const [importText, setImportText] = useState("");
+  const [importError, setImportError] = useState(null);
+  const [importDone, setImportDone] = useState(false);
+  const [espnWeek, setEspnWeek] = useState(week);
+  const [confirmClear, setConfirmClear] = useState(false);
+
+  useEffect(() => { setEspnWeek(week); setConfirmClear(false); }, [week]);
+
+  const handleClearWeek = async () => {
+    await clearWeek();
+    setConfirmClear(false);
+  };
+
+  if (!config) return null;
+
+  const updateGame = (i, field, value) => {
+    const games = [...config.games];
+    games[i] = { ...games[i], [field]: value };
+    saveConfig({ ...config, games });
+  };
+
+  const updateResult = (i, value) => {
+    const results = [...(config.results || [])];
+    results[i] = value;
+    saveConfig({ ...config, results });
+  };
+
+  const toggleMnf = (i) => {
+    const current = getMnfIndices(config);
+    const mnfIndices = current.includes(i) ? current.filter((x) => x !== i) : [...current, i];
+    saveConfig({ ...config, mnfIndices });
+  };
+
+  const handleSync = async () => {
+    setSyncStatus("loading");
+    setSyncError(null);
+    try {
+      const { games, results, mnfIndices, thuIndices, mnfActual } = await fetchWeekFromESPN(espnWeek, seasonYear, seasonType);
+      await saveConfig({
+        ...config,
+        games,
+        results,
+        mnfIndices,
+        thuIndices,
+        mnfActual: mnfActual ?? config.mnfActual,
+      });
+      setSyncStatus("done");
+      setTimeout(() => setSyncStatus("idle"), 2500);
+    } catch (e) {
+      setSyncStatus("error");
+      setSyncError(e.message || "Couldn't reach ESPN");
+    }
+  };
+
+  const handleImport = async () => {
+    setImportError(null);
+    setImportDone(false);
+    try {
+      const cleaned = importText
+        .trim()
+        .replace(/^```(json)?/i, "")
+        .replace(/```$/, "")
+        .trim();
+      const parsed = JSON.parse(cleaned);
+      if (!Array.isArray(parsed.games)) throw new Error("no games array in pasted data");
+      await saveConfig({
+        ...config,
+        games: parsed.games,
+        results: parsed.results || [],
+        mnfIndices: parsed.mnfIndices || [],
+        thuIndices: parsed.thuIndices || [],
+        mnfActual: parsed.mnfActual ?? config.mnfActual,
+      });
+      setImportDone(true);
+      setImportText("");
+      setTimeout(() => setImportDone(false), 2500);
+    } catch (e) {
+      setImportError(`Couldn't read that (${e.message}). Paste exactly what Claude gave you, nothing added or removed.`);
+    }
+  };
+
+  const toggleThu = (i) => {
+    const current = getThuIndices(config);
+    const thuIndices = current.includes(i) ? current.filter((x) => x !== i) : [...current, i];
+    saveConfig({ ...config, thuIndices });
+  };
+
+  const toLocalInputValue = (iso) => {
+    if (!iso) return "";
+    const d = new Date(iso);
+    const pad = (n) => String(n).padStart(2, "0");
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  };
+
+  const validGames = config.games.map((g, i) => ({ ...g, i })).filter((g) => g.away && g.home);
+  const mnfIndices = getMnfIndices(config);
+
+  return (
+    <div className="mt-6 space-y-6">
+      <section>
+        <div className="mb-3">
+          <label className="text-xs font-mono text-slate-500 uppercase block mb-1">
+            Week {week} label <span className="text-slate-600 normal-case">(shows in everyone's week picker)</span>
+          </label>
+          <input
+            type="text"
+            value={config.label || ""}
+            onChange={(e) => saveConfig({ ...config, label: e.target.value })}
+            placeholder='e.g. "TEST — Preseason Wk 2"'
+            className="w-full bg-slate-900 border border-slate-700 rounded px-3 py-1.5 text-sm"
+          />
+        </div>
+        <div className="flex flex-wrap items-center gap-2 mb-2">
+          <label className="text-xs font-mono text-slate-500 uppercase">Type</label>
+          <select
+            value={seasonType}
+            onChange={(e) => setSeasonType(Number(e.target.value))}
+            className="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-sm font-mono"
+          >
+            <option value={1}>Preseason</option>
+            <option value={2}>Regular season</option>
+          </select>
+          <label className="text-xs font-mono text-slate-500 uppercase ml-2">Year</label>
+          <input
+            type="number"
+            value={seasonYear}
+            onChange={(e) => setSeasonYear(Number(e.target.value))}
+            className="w-20 bg-slate-900 border border-slate-700 rounded px-2 py-1 text-sm font-mono"
+          />
+          <label className="text-xs font-mono text-slate-500 uppercase ml-2">ESPN wk</label>
+          <input
+            type="number"
+            value={espnWeek}
+            onChange={(e) => setEspnWeek(Number(e.target.value))}
+            className="w-14 bg-slate-900 border border-slate-700 rounded px-2 py-1 text-sm font-mono"
+          />
+          <div className="ml-auto flex items-center gap-2">
+            {confirmClear ? (
+              <>
+                <span className="text-[11px] text-red-400">Erase Week {week}'s games & picks?</span>
+                <button
+                  onClick={handleClearWeek}
+                  className="bg-red-600 text-white font-bold text-xs px-2 py-1 rounded"
+                >
+                  Yes, clear it
+                </button>
+                <button
+                  onClick={() => setConfirmClear(false)}
+                  className="text-xs text-slate-500 px-2 py-1"
+                >
+                  Cancel
+                </button>
+              </>
+            ) : (
+              <button
+                onClick={() => setConfirmClear(true)}
+                className="text-[11px] text-slate-500 hover:text-red-400 font-mono underline"
+              >
+                Clear Week {week}
+              </button>
+            )}
+          </div>
+        </div>
+        <div className="flex items-center gap-2 mb-3">
+          <p className="text-[10px] text-slate-600">
+            Loads into this app's Week {week} slot. Preseason weeks: 2=Wk1, 3=Wk2, 4=Wk3 (1=Hall of Fame).
+          </p>
+          <button
+            onClick={handleSync}
+            disabled={syncStatus === "loading"}
+            className="ml-auto bg-emerald-500 disabled:bg-slate-700 text-slate-950 disabled:text-slate-400 font-bold text-xs px-3 py-1.5 rounded whitespace-nowrap"
+          >
+            {syncStatus === "loading" ? "Syncing…" : "Sync from ESPN"}
+          </button>
+        </div>
+        {syncStatus === "done" && (
+          <p className="text-emerald-400 text-xs mb-3">Synced — matchups and any final scores are filled in below.</p>
+        )}
+        {syncStatus === "error" && (
+          <p className="text-red-400 text-xs mb-3">
+            {syncError}. Direct sync often gets blocked by browser sandboxing — use the paste option below instead.
+          </p>
+        )}
+
+        <div className="bg-slate-900 border border-slate-800 rounded-lg p-3 mb-4">
+          <p className="text-xs text-slate-400 mb-2">
+            <span className="font-semibold text-slate-300">If sync fails:</span> ask Claude to "pull Week {espnWeek}'s
+            {" "}{seasonType === 1 ? "preseason" : "regular season"} games," paste what it gives you here, and apply.
+          </p>
+          <textarea
+            value={importText}
+            onChange={(e) => setImportText(e.target.value)}
+            rows={3}
+            placeholder="Paste the JSON block Claude gives you here"
+            className="w-full bg-slate-950 border border-slate-700 rounded px-3 py-2 text-xs font-mono"
+          />
+          <div className="flex items-center gap-2 mt-2">
+            <button
+              onClick={handleImport}
+              className="bg-amber-400 text-slate-950 font-bold text-xs px-3 py-1.5 rounded"
+            >
+              Apply pasted data
+            </button>
+            {importDone && <span className="text-emerald-400 text-xs">Applied ✓</span>}
+            {importError && <span className="text-red-400 text-xs">{importError}</span>}
+          </div>
+        </div>
+
+        <h2 className="text-xs uppercase tracking-widest text-slate-500 font-mono mb-2">Week {week}'s games</h2>
+        <div className="space-y-2">
+          {config.games.map((g, i) => (
+            <div key={i} className="flex gap-2 items-center">
+              <input
+                value={g.away}
+                onChange={(e) => updateGame(i, "away", e.target.value.toUpperCase())}
+                placeholder="AWAY"
+                className="w-20 bg-slate-900 border border-slate-800 rounded px-2 py-1.5 text-sm font-mono text-center"
+              />
+              <span className="text-slate-600 text-xs">@</span>
+              <input
+                value={g.home}
+                onChange={(e) => updateGame(i, "home", e.target.value.toUpperCase())}
+                placeholder="HOME"
+                className="w-20 bg-slate-900 border border-slate-800 rounded px-2 py-1.5 text-sm font-mono text-center"
+              />
+              <label className="flex items-center gap-1 text-[10px] text-slate-500 ml-2">
+                <input
+                  type="checkbox"
+                  checked={mnfIndices.includes(i)}
+                  onChange={() => toggleMnf(i)}
+                />
+                MNF
+              </label>
+              <label className="flex items-center gap-1 text-[10px] text-slate-500">
+                <input
+                  type="checkbox"
+                  checked={getThuIndices(config).includes(i)}
+                  onChange={() => toggleThu(i)}
+                />
+                THU
+              </label>
+              {(g.away || g.home) && (
+                <select
+                  value={config.results?.[i] || ""}
+                  onChange={(e) => updateResult(i, e.target.value)}
+                  className="ml-auto bg-slate-900 border border-slate-800 rounded px-2 py-1 text-xs font-mono"
+                >
+                  <option value="">winner…</option>
+                  {[g.away, g.home].filter(Boolean).map((t) => (
+                    <option key={t} value={t}>{t}</option>
+                  ))}
+                </select>
+              )}
+            </div>
+          ))}
+        </div>
+
+        <div className="grid grid-cols-2 gap-3 mt-4">
+          <div>
+            <label className="text-[10px] font-mono text-slate-500 uppercase block mb-1">
+              Thursday games lock at
+            </label>
+            <input
+              type="datetime-local"
+              value={toLocalInputValue(config.thuDeadline)}
+              onChange={(e) => saveConfig({ ...config, thuDeadline: e.target.value ? new Date(e.target.value).toISOString() : null })}
+              className="w-full bg-slate-900 border border-slate-700 rounded px-2 py-1.5 text-xs font-mono"
+            />
+          </div>
+          <div>
+            <label className="text-[10px] font-mono text-slate-500 uppercase block mb-1">
+              All other games lock at
+            </label>
+            <input
+              type="datetime-local"
+              value={toLocalInputValue(config.mainDeadline)}
+              onChange={(e) => saveConfig({ ...config, mainDeadline: e.target.value ? new Date(e.target.value).toISOString() : null })}
+              className="w-full bg-slate-900 border border-slate-700 rounded px-2 py-1.5 text-xs font-mono"
+            />
+          </div>
+        </div>
+        <p className="text-[10px] text-slate-600 mt-1">
+          Games marked THU lock at the first deadline; everything else locks at the second. Both use your device's local time zone.
+        </p>
+
+        <div className="flex items-center gap-2 mt-4">
+          <label className="text-xs font-mono text-slate-500 uppercase">MNF actual combined score</label>
+          <input
+            type="number"
+            value={config.mnfActual ?? ""}
+            onChange={(e) => saveConfig({ ...config, mnfActual: e.target.value === "" ? null : Number(e.target.value) })}
+            className="w-24 bg-slate-900 border border-slate-700 rounded px-2 py-1 text-sm font-mono"
+          />
+          <span className="text-[10px] text-slate-600">auto-fills once synced games marked MNF are final</span>
+        </div>
+
+        <label className="flex items-center gap-2 mt-3 text-xs text-slate-400">
+          <input
+            type="checkbox"
+            checked={!!config.locked}
+            onChange={(e) => saveConfig({ ...config, locked: e.target.checked })}
+          />
+          Force lock everything right now (overrides the deadlines above)
+        </label>
+      </section>
+
+      {validGames.length > 0 && !isWeekRevealed(config) && (
+        <section>
+          <p className="text-xs text-slate-500 bg-slate-900 border border-slate-800 rounded-lg px-3 py-3">
+            Picks are hidden — including from this screen — until you lock the week above.
+            {" "}This keeps anyone from picking after seeing everyone else's confidence points.
+          </p>
+        </section>
+      )}
+
+      {validGames.length > 0 && isWeekRevealed(config) && (
+        <section>
+          <h2 className="text-xs uppercase tracking-widest text-slate-500 font-mono mb-2">
+            Live scores — Week {week}
+          </h2>
+          <div className="bg-slate-900 border border-slate-800 rounded-lg divide-y divide-slate-800">
+            {players.map((p) => {
+              const submitted = !!allPicksThisWeek[p];
+              const isWinner = weekWinners.includes(p);
+              return (
+                <div key={p} className="flex items-center justify-between px-3 py-2">
+                  <span className={`text-sm ${submitted ? "text-slate-200" : "text-slate-600"}`}>
+                    {p}{!submitted && <span className="text-[10px] ml-2 text-slate-600">no picks submitted</span>}
+                  </span>
+                  <div className="flex items-center gap-2">
+                    <span className="font-mono text-sm text-slate-300">{weekScoresNow[p] || 0}</span>
+                    {isWinner && <span className="text-[10px] bg-amber-400 text-slate-950 font-bold px-1.5 py-0.5 rounded">WIN</span>}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+          {weekWinners.length > 0 && (
+            <p className="text-xs text-slate-500 mt-2">
+              {weekWinners.length > 1 ? "Tie broken by " : "Winner determined by "}
+              points, then Monday Night tiebreaker (closest to actual without going over).
+            </p>
+          )}
+
+          <h2 className="text-xs uppercase tracking-widest text-slate-500 font-mono mt-6 mb-2">
+            Everyone's picks — Week {week}
+          </h2>
+          <div className="overflow-x-auto bg-slate-900 border border-slate-800 rounded-lg">
+            <table className="w-full text-xs border-collapse">
+              <thead>
+                <tr className="border-b border-slate-800">
+                  <th className="text-left text-slate-500 font-mono font-normal py-2 px-2">Game</th>
+                  {players.map((p) => (
+                    <th key={p} className="text-slate-400 font-mono font-normal py-2 px-1.5 whitespace-nowrap">{p}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {validGames.map((g) => (
+                  <tr key={g.i} className="border-b border-slate-800/60 last:border-0">
+                    <td className="py-1.5 px-2 font-mono text-slate-400 whitespace-nowrap">{g.away}@{g.home}</td>
+                    {players.map((p) => {
+                      const sel = allPicksThisWeek[p]?.picks?.[g.i];
+                      return (
+                        <td key={p} className="text-center py-1.5 px-1.5 font-mono whitespace-nowrap">
+                          {sel && sel.team ? (
+                            <span className="text-slate-200">
+                              {sel.team}<span className="text-amber-400">·{sel.points}</span>
+                            </span>
+                          ) : (
+                            <span className="text-slate-700">—</span>
+                          )}
+                        </td>
+                      );
+                    })}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      )}
+
+      <section>
+        <button
+          onClick={() => setEditPlayers((v) => !v)}
+          className="text-xs text-slate-500 hover:text-slate-300 font-mono"
+        >
+          {editPlayers ? "Cancel" : "Edit player list"}
+        </button>
+        {editPlayers && (
+          <div className="mt-2">
+            <textarea
+              value={playerText}
+              onChange={(e) => setPlayerText(e.target.value)}
+              rows={8}
+              className="w-full bg-slate-900 border border-slate-800 rounded px-3 py-2 text-sm font-mono"
+            />
+            <button
+              onClick={() => {
+                setPlayers(playerText.split("\n").map((s) => s.trim()).filter(Boolean));
+                setEditPlayers(false);
+              }}
+              className="mt-2 bg-amber-400 text-slate-950 font-bold text-sm px-4 py-1.5 rounded"
+            >
+              Save names
+            </button>
+          </div>
+        )}
+      </section>
+    </div>
+  );
+}
+
+function StandingsTab({ seasonScores, loading, players, weeklyBoard }) {
+  if (loading || !seasonScores) {
+    return <p className="text-slate-500 mt-8 text-sm">Crunching the season…</p>;
+  }
+  const playedWeeks = Object.keys(weeklyBoard).map(Number).sort((a, b) => a - b);
+  const sorted = [...players].sort(
+    (a, b) => (seasonScores[b]?.total || 0) - (seasonScores[a]?.total || 0)
+  );
+  const totalsDesc = sorted.map((p) => seasonScores[p]?.total || 0);
+  const lastIdx = sorted.length - 1;
+
+  const rankStyle = (idx) => {
+    if (totalsDesc[idx] === 0) return "";
+    if (idx === 0) return "bg-amber-400/15 border-l-2 border-amber-400";
+    if (idx === 1) return "bg-slate-300/10 border-l-2 border-slate-300";
+    if (idx === 2) return "bg-orange-700/15 border-l-2 border-orange-600";
+    if (idx === 3) return "bg-emerald-500/10 border-l-2 border-emerald-500/60";
+    if (idx === lastIdx && sorted.length > 4) return "bg-red-900/20 border-l-2 border-red-700";
+    return "";
+  };
+  const rankBadge = (idx) => {
+    if (totalsDesc[idx] === 0) return null;
+    if (idx === 0) return <span className="text-[10px] bg-amber-400 text-slate-950 font-bold px-1.5 py-0.5 rounded">1ST</span>;
+    if (idx === 1) return <span className="text-[10px] bg-slate-300 text-slate-950 font-bold px-1.5 py-0.5 rounded">2ND</span>;
+    if (idx === 2) return <span className="text-[10px] bg-orange-600 text-slate-950 font-bold px-1.5 py-0.5 rounded">3RD</span>;
+    if (idx === 3) return <span className="text-[10px] bg-emerald-500 text-slate-950 font-bold px-1.5 py-0.5 rounded">4TH</span>;
+    if (idx === lastIdx && sorted.length > 4) return <span className="text-[10px] bg-red-800 text-red-100 font-bold px-1.5 py-0.5 rounded">LAST</span>;
+    return null;
+  };
+
+  const tieNote = [0, 1, 2, 3, lastIdx].some((idx, k, arr) => {
+    if (idx == null || totalsDesc[idx] == null || totalsDesc[idx] === 0) return false;
+    const dupCount = totalsDesc.filter((t) => t === totalsDesc[idx]).length;
+    return dupCount > 1;
+  });
+
+  return (
+    <div className="mt-6 space-y-8">
+      <section>
+        <h2 className="text-xs uppercase tracking-widest text-slate-500 font-mono mb-3">
+          Weekly results — every player, every week
+        </h2>
+        {playedWeeks.length === 0 ? (
+          <p className="text-slate-600 text-sm">No weeks have results yet.</p>
+        ) : (
+          <div className="overflow-x-auto bg-slate-900 border border-slate-800 rounded-lg">
+            <table className="w-full text-xs border-collapse">
+              <thead>
+                <tr className="border-b border-slate-800">
+                  <th className="sticky left-0 bg-slate-900 text-left text-slate-500 font-mono font-normal py-2 px-2">Player</th>
+                  {playedWeeks.map((w) => (
+                    <th key={w} className="text-slate-400 font-mono font-normal py-2 px-2 whitespace-nowrap">Wk {w}</th>
+                  ))}
+                  <th className="text-amber-400 font-mono font-normal py-2 px-2 whitespace-nowrap">Total</th>
+                </tr>
+              </thead>
+              <tbody>
+                {sorted.map((p) => (
+                  <tr key={p} className="border-b border-slate-800/60 last:border-0">
+                    <td className="sticky left-0 bg-slate-900 py-1.5 px-2 font-semibold whitespace-nowrap">{p}</td>
+                    {playedWeeks.map((w) => {
+                      const won = weeklyBoard[w]?.winners?.includes(p);
+                      const score = weeklyBoard[w]?.scores?.[p] || 0;
+                      return (
+                        <td
+                          key={w}
+                          className={`text-center py-1.5 px-2 font-mono ${won ? "bg-amber-400/20 text-amber-300 font-bold" : "text-slate-300"}`}
+                        >
+                          {score}
+                        </td>
+                      );
+                    })}
+                    <td className="text-center py-1.5 px-2 font-mono font-bold text-amber-400">
+                      {seasonScores[p]?.total || 0}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+        <p className="text-[11px] text-slate-600 mt-2">
+          Amber cells mark that week's winner (or co-winners after a tiebreak).
+        </p>
+      </section>
+
+      <section>
+        <h2 className="text-xs uppercase tracking-widest text-slate-500 font-mono mb-3">Season standings</h2>
+        <div className="bg-slate-900 border border-slate-800 rounded-lg divide-y divide-slate-800">
+          {sorted.map((p, idx) => (
+            <div key={p} className={`flex items-center justify-between px-4 py-3 ${rankStyle(idx)}`}>
+              <div className="flex items-center gap-3">
+                <span className="font-mono text-xs text-slate-600 w-5">{idx + 1}</span>
+                <span className="font-semibold">{p}</span>
+                {rankBadge(idx)}
+              </div>
+              <div className="flex items-center gap-4 text-sm">
+                <span className="text-slate-500 font-mono">{seasonScores[p]?.weeklyWins || 0} wks won</span>
+                <span className="font-mono text-amber-400 font-bold">{seasonScores[p]?.total || 0} pts</span>
+              </div>
+            </div>
+          ))}
+        </div>
+        <p className="text-[11px] text-slate-600 mt-3">
+          Only weeks with results entered on the Results tab count toward totals.
+          {" "}1st, 2nd, 3rd and 4th place are highlighted for the season pot; last place is on drink duty.
+          {tieNote && " There's a tie at one of these spots — worth double-checking before payouts."}
+        </p>
+      </section>
+    </div>
+  );
+}
+export default FootballPool;
+</script>
+</body>
+</html>
