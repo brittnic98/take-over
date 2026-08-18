@@ -6,7 +6,15 @@ import React, {
 } from "react";
 
 import { initializeApp } from "firebase/app";
-import { getFirestore } from "firebase/firestore";
+import {
+  getFirestore,
+  doc,
+  getDoc,
+  setDoc,
+  deleteDoc,
+  collection,
+  getDocs,
+} from "firebase/firestore";
 const firebaseConfig = {
   apiKey: "AIzaSyDojfqEJsOeOyPBHS_apHUo9WRCdsQnkNI",
   authDomain: "football-pool-93b96.firebaseapp.com",
@@ -40,8 +48,8 @@ function useStorage() {
         return raw ? JSON.parse(raw) : null;
       }
       if (!db) return null;
-      const snap = await db.collection("poolData").doc(key).get();
-      return snap.exists ? JSON.parse(snap.data().value) : null;
+      const snap = await getDoc(doc(db, "poolData", key));
+      return snap.exists() ? JSON.parse(snap.data().value) : null;
     } catch {
       return null;
     }
@@ -54,7 +62,7 @@ function useStorage() {
         return true;
       }
       if (!db) return false;
-      await db.collection("poolData").doc(key).set({ value: JSON.stringify(value) });
+      await setDoc(doc(db, "poolData", key), { value: JSON.stringify(value) });
       return true;
     } catch {
       return false;
@@ -68,7 +76,7 @@ function useStorage() {
         return true;
       }
       if (!db) return false;
-      await db.collection("poolData").doc(key).delete();
+      await deleteDoc(doc(db, "poolData", key));
       return true;
     } catch {
       return false;
@@ -83,7 +91,7 @@ function useStorage() {
           .map((k) => k.slice(5));
       }
       if (!db) return [];
-      const snap = await db.collection("poolData").get();
+      const snap = await getDocs(collection(db, "poolData"));
       return snap.docs.map((d) => d.id).filter((id) => !prefix || id.startsWith(prefix));
     } catch {
       return [];
@@ -1305,6 +1313,3 @@ function StandingsTab({ seasonScores, loading, players, weeklyBoard }) {
   );
 }
 export default FootballPool;
-</script>
-</body>
-</html>
