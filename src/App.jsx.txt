@@ -103,6 +103,7 @@ function useStorage() {
 
 function weekKey(w) { return `week-config:${w}`; }
 function picksKey(w, p) { return `picks:${w}:${p}`; }
+function playerPinKey(p) { return `player-pin:${p}`; }
 
 function getMnfIndices(config) {
   if (!config) return [];
@@ -116,11 +117,41 @@ function getThuIndices(config) {
   return config.thuIndices;
 }
 
+const DAY_CODES = ["THU", "FRI", "SAT", "SUN", "MON"];
+const DAY_LABELS = { THU: "Thursday", FRI: "Friday", SAT: "Saturday", SUN: "Sunday", MON: "Monday" };
+const ET_DAY_TO_CODE = { 4: "THU", 5: "FRI", 6: "SAT", 0: "SUN", 1: "MON", 2: "TUE", 3: "WED" };
+
+// Returns the day-of-week code ("THU"/"FRI"/"SAT"/"SUN"/"MON") for a given
+// game index, using explicit per-game data if set, falling back to the old
+// thuIndices/mnfIndices flags for configs saved before this feature existed.
+function getGameDay(config, i) {
+  if (!config) return null;
+  if (Array.isArray(config.gameDays) && config.gameDays[i]) return config.gameDays[i];
+  if (getThuIndices(config).includes(i)) return "THU";
+  if (getMnfIndices(config).includes(i)) return "MON";
+  return null;
+}
+
+// Latest deadline that actually applies to games in this week's config —
+// used to decide when everyone's picks become visible to each other.
+function getLatestDeadline(config) {
+  if (!config) return null;
+  const deadlines = config.deadlines || {};
+  const daysInUse = new Set((config.gameDays || []).filter(Boolean));
+  const candidates = [];
+  daysInUse.forEach((d) => { if (deadlines[d]) candidates.push(deadlines[d]); });
+  if (config.mainDeadline) candidates.push(config.mainDeadline);
+  if (config.thuDeadline) candidates.push(config.thuDeadline);
+  if (candidates.length === 0) return null;
+  return candidates.reduce((max, d) => (new Date(d) > new Date(max) ? d : max));
+}
+
 function isGameLocked(config, i) {
   if (!config) return false;
   if (config.locked) return true;
-  const isThu = getThuIndices(config).includes(i);
-  const deadline = isThu ? config.thuDeadline : config.mainDeadline;
+  const day = getGameDay(config, i);
+  const deadlines = config.deadlines || {};
+  const deadline = (day && deadlines[day]) || config.mainDeadline;
   if (!deadline) return false;
   return new Date() >= new Date(deadline);
 }
@@ -128,8 +159,9 @@ function isGameLocked(config, i) {
 function isWeekRevealed(config) {
   if (!config) return false;
   if (config.locked) return true;
-  if (!config.mainDeadline) return false;
-  return new Date() >= new Date(config.mainDeadline);
+  const latest = getLatestDeadline(config);
+  if (!latest) return false;
+  return new Date() >= new Date(latest);
 }
 
 async function fetchWeekFromESPN(week, year, seasonType) {
@@ -144,6 +176,7 @@ async function fetchWeekFromESPN(week, year, seasonType) {
   const results = [];
   const mnfIndices = [];
   const thuIndices = [];
+  const gameDays = [];
 
   events.forEach((ev, i) => {
     const comp = ev.competitions[0];
@@ -160,6 +193,7 @@ async function fetchWeekFromESPN(week, year, seasonType) {
     const etDay = new Date(new Date(ev.date).toLocaleString("en-US", { timeZone: "America/New_York" })).getDay();
     if (etDay === 1) mnfIndices.push(i);
     if (etDay === 4) thuIndices.push(i);
+    gameDays.push(ET_DAY_TO_CODE[etDay] || null);
   });
 
   let mnfActual = null;
@@ -173,7 +207,7 @@ async function fetchWeekFromESPN(week, year, seasonType) {
     }
   }
 
-  return { games, results, mnfIndices, thuIndices, mnfActual };
+  return { games, results, mnfIndices, thuIndices, gameDays, mnfActual };
 }
 
 function tiebreak(candidates, mnfGuesses, mnfActual) {
@@ -296,10 +330,12 @@ function FootballPool() {
         games: Array.from({ length: 16 }, emptyGame),
         mnfIndices: [],
         thuIndices: [],
+        gameDays: [],
         results: [],
         mnfActual: null,
         thuDeadline: null,
         mainDeadline: null,
+        deadlines: {},
         locked: false,
         label: "",
       }
@@ -382,10 +418,12 @@ function FootballPool() {
       games: Array.from({ length: 16 }, emptyGame),
       mnfIndices: [],
       thuIndices: [],
+      gameDays: [],
       results: [],
       mnfActual: null,
       thuDeadline: null,
       mainDeadline: null,
+      deadlines: {},
       locked: false,
       label: "",
     };
@@ -478,6 +516,8 @@ function FootballPool() {
             savePicks={savePicks}
             saveState={saveState}
             week={week}
+            get={get}
+            set={set}
           />
         )}
         {tab === "admin" && (
@@ -495,6 +535,8 @@ function FootballPool() {
             seasonType={seasonType}
             setSeasonType={(t) => { setSeasonType(t); set("season-type", t); }}
             clearWeek={clearWeek}
+            get={get}
+            del={del}
           />
         )}
         {tab === "standings" && (
@@ -612,8 +654,147 @@ function Header({
   );
 }
 
-function PicksTab({ players, activePlayer, setActivePlayer, config, myPicks, setMyPicks, savePicks, saveState, week }) {
+function PlayerPinGate({ player, mode, get, set, onUnlock, onCancel }) {
+  const [pin, setPin] = useState("");
+  const [confirmPin, setConfirmPin] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const digitsOnly = (v) => v.replace(/\D/g, "").slice(0, 4);
+
+  const handleCreate = async () => {
+    if (pin.length !== 4) { setError("PIN must be exactly 4 digits"); return; }
+    if (pin !== confirmPin) { setError("PINs don't match"); return; }
+    setBusy(true);
+    await set(playerPinKey(player), pin);
+    setBusy(false);
+    onUnlock();
+  };
+
+  const handleEnter = async () => {
+    if (pin.length !== 4) { setError("Enter your 4-digit PIN"); return; }
+    setBusy(true);
+    const saved = await get(playerPinKey(player));
+    setBusy(false);
+    if (saved === pin) {
+      onUnlock();
+    } else {
+      setError("Incorrect PIN");
+      setPin("");
+    }
+  };
+
+  return (
+    <div className="mt-8">
+      <button onClick={onCancel} className="text-xs text-slate-500 hover:text-slate-300 mb-4">
+        ← switch player
+      </button>
+      <div className="bg-slate-900 border border-slate-800 rounded-lg p-4">
+        <p className="font-bold text-amber-400 mb-1">{player}</p>
+        {mode === "create" ? (
+          <>
+            <p className="text-xs text-slate-500 mb-3">
+              Set a 4-digit PIN to protect your picks — you'll enter it each time you come back to pick as {player}.
+            </p>
+            <label className="text-[10px] font-mono text-slate-500 uppercase block mb-1">Choose a PIN</label>
+            <input
+              type="password"
+              inputMode="numeric"
+              pattern="[0-9]*"
+              maxLength={4}
+              value={pin}
+              onChange={(e) => { setPin(digitsOnly(e.target.value)); setError(""); }}
+              className="w-full bg-slate-950 border border-slate-700 rounded px-3 py-2 text-lg font-mono tracking-widest text-center mb-2"
+              autoFocus
+            />
+            <label className="text-[10px] font-mono text-slate-500 uppercase block mb-1">Confirm PIN</label>
+            <input
+              type="password"
+              inputMode="numeric"
+              pattern="[0-9]*"
+              maxLength={4}
+              value={confirmPin}
+              onChange={(e) => { setConfirmPin(digitsOnly(e.target.value)); setError(""); }}
+              onKeyDown={(e) => { if (e.key === "Enter") handleCreate(); }}
+              className="w-full bg-slate-950 border border-slate-700 rounded px-3 py-2 text-lg font-mono tracking-widest text-center mb-3"
+            />
+            <button
+              onClick={handleCreate}
+              disabled={busy}
+              className="w-full bg-amber-400 disabled:bg-slate-700 text-slate-950 font-bold py-2 rounded"
+            >
+              {busy ? "Saving…" : "Set PIN & continue"}
+            </button>
+          </>
+        ) : (
+          <>
+            <p className="text-xs text-slate-500 mb-3">Enter your PIN to make picks as {player}.</p>
+            <input
+              type="password"
+              inputMode="numeric"
+              pattern="[0-9]*"
+              maxLength={4}
+              value={pin}
+              onChange={(e) => { setPin(digitsOnly(e.target.value)); setError(""); }}
+              onKeyDown={(e) => { if (e.key === "Enter") handleEnter(); }}
+              className="w-full bg-slate-950 border border-slate-700 rounded px-3 py-2 text-lg font-mono tracking-widest text-center mb-3"
+              autoFocus
+            />
+            <button
+              onClick={handleEnter}
+              disabled={busy}
+              className="w-full bg-amber-400 disabled:bg-slate-700 text-slate-950 font-bold py-2 rounded"
+            >
+              {busy ? "Checking…" : "Unlock"}
+            </button>
+            <p className="text-[11px] text-slate-600 mt-3">
+              Forgot your PIN? Ask the commissioner to reset it from the Admin tab.
+            </p>
+          </>
+        )}
+        {error && <p className="text-red-400 text-xs mt-2">{error}</p>}
+      </div>
+    </div>
+  );
+}
+
+function PicksTab({ players, activePlayer, setActivePlayer, config, myPicks, setMyPicks, savePicks, saveState, week, get, set }) {
+  const [pendingPlayer, setPendingPlayer] = useState(null);
+  const [pinMode, setPinMode] = useState(null);
+  const [checkingPin, setCheckingPin] = useState(false);
+
+  const handleChoosePlayer = async (p) => {
+    setPendingPlayer(p);
+    setCheckingPin(true);
+    const existing = await get(playerPinKey(p));
+    setCheckingPin(false);
+    setPinMode(existing ? "enter" : "create");
+  };
+
+  const cancelPinGate = () => {
+    setPendingPlayer(null);
+    setPinMode(null);
+  };
+
+  const handleUnlock = () => {
+    setActivePlayer(pendingPlayer);
+    setPendingPlayer(null);
+    setPinMode(null);
+  };
+
   if (!activePlayer) {
+    if (pendingPlayer && pinMode) {
+      return (
+        <PlayerPinGate
+          player={pendingPlayer}
+          mode={pinMode}
+          get={get}
+          set={set}
+          onUnlock={handleUnlock}
+          onCancel={cancelPinGate}
+        />
+      );
+    }
     return (
       <div className="mt-8">
         <p className="text-slate-400 text-sm mb-4">Who's picking?</p>
@@ -621,8 +802,9 @@ function PicksTab({ players, activePlayer, setActivePlayer, config, myPicks, set
           {players.map((p) => (
             <button
               key={p}
-              onClick={() => setActivePlayer(p)}
-              className="bg-slate-900 border border-slate-800 rounded-lg py-3 px-3 text-left hover:border-amber-500/50 transition-colors"
+              disabled={checkingPin}
+              onClick={() => handleChoosePlayer(p)}
+              className="bg-slate-900 border border-slate-800 rounded-lg py-3 px-3 text-left hover:border-amber-500/50 transition-colors disabled:opacity-50"
             >
               <span className="font-semibold">{p}</span>
             </button>
@@ -635,7 +817,12 @@ function PicksTab({ players, activePlayer, setActivePlayer, config, myPicks, set
   if (!myPicks) return <p className="text-slate-500 mt-8">Loading…</p>;
 
   const games = (config && config.games) || [];
-  const mainLocked = !!(config && (config.locked || (config.mainDeadline && new Date() >= new Date(config.mainDeadline))));
+  const validGameIndices = games.map((g, i) => (g.away && g.home ? i : null)).filter((i) => i != null);
+  const mainLocked = !!(
+    config &&
+    (config.locked ||
+      (validGameIndices.length > 0 && validGameIndices.every((i) => isGameLocked(config, i))))
+  );
 
   const setSel = (i, field, value) => {
     const next = { ...myPicks, picks: [...myPicks.picks] };
@@ -689,9 +876,12 @@ function PicksTab({ players, activePlayer, setActivePlayer, config, myPicks, set
       {validGames > 0 && !mainLocked && (
         <p className="text-slate-500 text-xs mb-4">
           {validGames} games this week — use each confidence value from 1–{validGames} exactly once.
-          {config.thuDeadline && <> Thursday games lock {fmtDeadline(config.thuDeadline)}.</>}
-          {config.mainDeadline && <> Everything else locks {fmtDeadline(config.mainDeadline)}.</>}
-          {" "}Your picks stay private until the week is fully locked.
+          {" "}
+          {DAY_CODES.filter((d) => (config.gameDays || []).includes(d) && config.deadlines?.[d]).map((d) => (
+            <span key={d}>{DAY_LABELS[d]} games lock {fmtDeadline(config.deadlines[d])}. </span>
+          ))}
+          {config.mainDeadline && <>Anything without a specific deadline locks {fmtDeadline(config.mainDeadline)}. </>}
+          Your picks stay private until the week is fully locked.
         </p>
       )}
 
@@ -700,7 +890,7 @@ function PicksTab({ players, activePlayer, setActivePlayer, config, myPicks, set
           if (!g.away || !g.home) return null;
           const sel = myPicks.picks[i] || {};
           const isMnf = getMnfIndices(config).includes(i);
-          const isThu = getThuIndices(config).includes(i);
+          const gameDay = getGameDay(config, i);
           const gameLocked = isGameLocked(config, i);
           return (
             <div key={i} className="bg-slate-900 border border-slate-800 rounded-lg p-3">
@@ -708,7 +898,7 @@ function PicksTab({ players, activePlayer, setActivePlayer, config, myPicks, set
                 <span className="text-sm font-mono text-slate-300">{g.away} @ {g.home}</span>
                 <div className="flex items-center gap-2">
                   {isMnf && <span className="text-[10px] uppercase tracking-wide text-amber-400 font-semibold">MNF</span>}
-                  {isThu && <span className="text-[10px] uppercase tracking-wide text-sky-400 font-semibold">THU</span>}
+                  {gameDay && <span className="text-[10px] uppercase tracking-wide text-sky-400 font-semibold">{gameDay}</span>}
                   {gameLocked && <span className="text-[10px] uppercase tracking-wide text-slate-500 font-semibold">LOCKED</span>}
                 </div>
               </div>
@@ -781,7 +971,7 @@ function PicksTab({ players, activePlayer, setActivePlayer, config, myPicks, set
   );
 }
 
-function AdminTab({ config, saveConfig, players, setPlayers, allPicksThisWeek, weekScoresNow, weekWinners, week, seasonYear, setSeasonYear, seasonType, setSeasonType, clearWeek }) {
+function AdminTab({ config, saveConfig, players, setPlayers, allPicksThisWeek, weekScoresNow, weekWinners, week, seasonYear, setSeasonYear, seasonType, setSeasonType, clearWeek, get, del }) {
   const [editPlayers, setEditPlayers] = useState(false);
   const [playerText, setPlayerText] = useState(players.join("\n"));
   const [syncStatus, setSyncStatus] = useState("idle");
@@ -791,8 +981,29 @@ function AdminTab({ config, saveConfig, players, setPlayers, allPicksThisWeek, w
   const [importDone, setImportDone] = useState(false);
   const [espnWeek, setEspnWeek] = useState(week);
   const [confirmClear, setConfirmClear] = useState(false);
+  const [playerPinStatus, setPlayerPinStatus] = useState({});
+  const [pinResetBusy, setPinResetBusy] = useState(null);
 
   useEffect(() => { setEspnWeek(week); setConfirmClear(false); }, [week]);
+
+  const loadPinStatus = useCallback(async () => {
+    const status = {};
+    for (const p of players) {
+      const pin = await get(playerPinKey(p));
+      status[p] = !!pin;
+    }
+    setPlayerPinStatus(status);
+  }, [players, get]);
+
+  useEffect(() => { loadPinStatus(); }, [loadPinStatus]);
+
+  const handleResetPin = async (p) => {
+    if (!window.confirm(`Reset ${p}'s PIN? They'll be asked to set a new one next time they pick.`)) return;
+    setPinResetBusy(p);
+    await del(playerPinKey(p));
+    setPlayerPinStatus((prev) => ({ ...prev, [p]: false }));
+    setPinResetBusy(null);
+  };
 
   const handleClearWeek = async () => {
     await clearWeek();
@@ -823,13 +1034,14 @@ function AdminTab({ config, saveConfig, players, setPlayers, allPicksThisWeek, w
     setSyncStatus("loading");
     setSyncError(null);
     try {
-      const { games, results, mnfIndices, thuIndices, mnfActual } = await fetchWeekFromESPN(espnWeek, seasonYear, seasonType);
+      const { games, results, mnfIndices, thuIndices, gameDays, mnfActual } = await fetchWeekFromESPN(espnWeek, seasonYear, seasonType);
       await saveConfig({
         ...config,
         games,
         results,
         mnfIndices,
         thuIndices,
+        gameDays,
         mnfActual: mnfActual ?? config.mnfActual,
       });
       setSyncStatus("done");
@@ -857,6 +1069,7 @@ function AdminTab({ config, saveConfig, players, setPlayers, allPicksThisWeek, w
         results: parsed.results || [],
         mnfIndices: parsed.mnfIndices || [],
         thuIndices: parsed.thuIndices || [],
+        gameDays: parsed.gameDays || [],
         mnfActual: parsed.mnfActual ?? config.mnfActual,
       });
       setImportDone(true);
@@ -867,10 +1080,10 @@ function AdminTab({ config, saveConfig, players, setPlayers, allPicksThisWeek, w
     }
   };
 
-  const toggleThu = (i) => {
-    const current = getThuIndices(config);
-    const thuIndices = current.includes(i) ? current.filter((x) => x !== i) : [...current, i];
-    saveConfig({ ...config, thuIndices });
+  const setGameDay = (i, dayCode) => {
+    const gameDays = [...(config.gameDays || [])];
+    gameDays[i] = dayCode || null;
+    saveConfig({ ...config, gameDays });
   };
 
   const toLocalInputValue = (iso) => {
@@ -894,7 +1107,7 @@ function AdminTab({ config, saveConfig, players, setPlayers, allPicksThisWeek, w
             type="text"
             value={config.label || ""}
             onChange={(e) => saveConfig({ ...config, label: e.target.value })}
-            placeholder='e.g. "TEST — Preseason Wk 2"'
+            placeholder='e.g. "Preseason Wk 2", "Rivalry Week", "Thanksgiving Classic"'
             className="w-full bg-slate-900 border border-slate-700 rounded px-3 py-1.5 text-sm"
           />
         </div>
@@ -995,9 +1208,13 @@ function AdminTab({ config, saveConfig, players, setPlayers, allPicksThisWeek, w
         </div>
 
         <h2 className="text-xs uppercase tracking-widest text-slate-500 font-mono mb-2">Week {week}'s games</h2>
+        <p className="text-[10px] text-slate-600 mb-2">
+          Set each game's day so you can lock Thursday/Friday/Saturday games earlier than Sunday's.
+          Synced games from ESPN fill this in automatically — double check preseason games since they can fall on unusual days.
+        </p>
         <div className="space-y-2">
           {config.games.map((g, i) => (
-            <div key={i} className="flex gap-2 items-center">
+            <div key={i} className="flex gap-2 items-center flex-wrap">
               <input
                 value={g.away}
                 onChange={(e) => updateGame(i, "away", e.target.value.toUpperCase())}
@@ -1011,21 +1228,23 @@ function AdminTab({ config, saveConfig, players, setPlayers, allPicksThisWeek, w
                 placeholder="HOME"
                 className="w-20 bg-slate-900 border border-slate-800 rounded px-2 py-1.5 text-sm font-mono text-center"
               />
-              <label className="flex items-center gap-1 text-[10px] text-slate-500 ml-2">
+              <select
+                value={getGameDay(config, i) || ""}
+                onChange={(e) => setGameDay(i, e.target.value)}
+                className="bg-slate-900 border border-slate-800 rounded px-2 py-1 text-[10px] font-mono text-slate-300"
+              >
+                <option value="">day…</option>
+                {DAY_CODES.map((d) => (
+                  <option key={d} value={d}>{d}</option>
+                ))}
+              </select>
+              <label className="flex items-center gap-1 text-[10px] text-slate-500 ml-1">
                 <input
                   type="checkbox"
                   checked={mnfIndices.includes(i)}
                   onChange={() => toggleMnf(i)}
                 />
-                MNF
-              </label>
-              <label className="flex items-center gap-1 text-[10px] text-slate-500">
-                <input
-                  type="checkbox"
-                  checked={getThuIndices(config).includes(i)}
-                  onChange={() => toggleThu(i)}
-                />
-                THU
+                MNF tiebreaker
               </label>
               {(g.away || g.home) && (
                 <select
@@ -1043,32 +1262,43 @@ function AdminTab({ config, saveConfig, players, setPlayers, allPicksThisWeek, w
           ))}
         </div>
 
-        <div className="grid grid-cols-2 gap-3 mt-4">
-          <div>
-            <label className="text-[10px] font-mono text-slate-500 uppercase block mb-1">
-              Thursday games lock at
-            </label>
-            <input
-              type="datetime-local"
-              value={toLocalInputValue(config.thuDeadline)}
-              onChange={(e) => saveConfig({ ...config, thuDeadline: e.target.value ? new Date(e.target.value).toISOString() : null })}
-              className="w-full bg-slate-900 border border-slate-700 rounded px-2 py-1.5 text-xs font-mono"
-            />
-          </div>
-          <div>
-            <label className="text-[10px] font-mono text-slate-500 uppercase block mb-1">
-              All other games lock at
-            </label>
-            <input
-              type="datetime-local"
-              value={toLocalInputValue(config.mainDeadline)}
-              onChange={(e) => saveConfig({ ...config, mainDeadline: e.target.value ? new Date(e.target.value).toISOString() : null })}
-              className="w-full bg-slate-900 border border-slate-700 rounded px-2 py-1.5 text-xs font-mono"
-            />
-          </div>
+        <h2 className="text-xs uppercase tracking-widest text-slate-500 font-mono mt-5 mb-2">Lock deadlines by day</h2>
+        <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+          {DAY_CODES.map((d) => (
+            <div key={d}>
+              <label className="text-[10px] font-mono text-slate-500 uppercase block mb-1">
+                {DAY_LABELS[d]} games lock at
+              </label>
+              <input
+                type="datetime-local"
+                value={toLocalInputValue(config.deadlines?.[d])}
+                onChange={(e) =>
+                  saveConfig({
+                    ...config,
+                    deadlines: {
+                      ...(config.deadlines || {}),
+                      [d]: e.target.value ? new Date(e.target.value).toISOString() : null,
+                    },
+                  })
+                }
+                className="w-full bg-slate-900 border border-slate-700 rounded px-2 py-1.5 text-xs font-mono"
+              />
+            </div>
+          ))}
+        </div>
+        <div className="mt-3">
+          <label className="text-[10px] font-mono text-slate-500 uppercase block mb-1">
+            Fallback deadline (any game without a day set, or a day left blank above)
+          </label>
+          <input
+            type="datetime-local"
+            value={toLocalInputValue(config.mainDeadline)}
+            onChange={(e) => saveConfig({ ...config, mainDeadline: e.target.value ? new Date(e.target.value).toISOString() : null })}
+            className="w-full max-w-xs bg-slate-900 border border-slate-700 rounded px-2 py-1.5 text-xs font-mono"
+          />
         </div>
         <p className="text-[10px] text-slate-600 mt-1">
-          Games marked THU lock at the first deadline; everything else locks at the second. Both use your device's local time zone.
+          Each game locks at its own day's deadline; leave a day blank to fall back to the deadline above. All times use your device's local time zone.
         </p>
 
         <div className="flex items-center gap-2 mt-4">
@@ -1168,6 +1398,35 @@ function AdminTab({ config, saveConfig, players, setPlayers, allPicksThisWeek, w
           </div>
         </section>
       )}
+
+      <section>
+        <h2 className="text-xs uppercase tracking-widest text-slate-500 font-mono mb-2">Player PINs</h2>
+        <p className="text-[10px] text-slate-600 mb-2">
+          Each player sets their own 4-digit PIN the first time they make picks. Results and standings stay open to everyone —
+          only picking is PIN-protected. Reset a PIN here if someone forgets theirs.
+        </p>
+        <div className="bg-slate-900 border border-slate-800 rounded-lg divide-y divide-slate-800">
+          {players.map((p) => (
+            <div key={p} className="flex items-center justify-between px-3 py-2">
+              <span className="text-sm">{p}</span>
+              <div className="flex items-center gap-3">
+                <span className={`text-[10px] font-mono ${playerPinStatus[p] ? "text-emerald-400" : "text-slate-600"}`}>
+                  {playerPinStatus[p] ? "PIN set" : "no PIN yet"}
+                </span>
+                {playerPinStatus[p] && (
+                  <button
+                    onClick={() => handleResetPin(p)}
+                    disabled={pinResetBusy === p}
+                    className="text-[11px] text-slate-500 hover:text-red-400 font-mono underline disabled:opacity-50"
+                  >
+                    {pinResetBusy === p ? "Resetting…" : "Reset"}
+                  </button>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      </section>
 
       <section>
         <button
