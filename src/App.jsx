@@ -367,7 +367,7 @@ function FootballPool() {
   }, [tab, isAdmin]);
 
   useEffect(() => {
-    if (tab === "admin" || tab === "standings") loadAllPicksThisWeek();
+    if (tab === "admin" || tab === "standings" || tab === "everyone") loadAllPicksThisWeek();
   }, [tab, week, loadAllPicksThisWeek]);
 
   const loadSeason = useCallback(async () => {
@@ -539,6 +539,16 @@ function FootballPool() {
             del={del}
           />
         )}
+        {tab === "everyone" && (
+          <EveryonePicksTab
+            players={players}
+            config={config}
+            allPicksThisWeek={allPicksThisWeek}
+            week={week}
+            weekScoresNow={weekScoresNow}
+            weekWinners={weekWinners}
+          />
+        )}
         {tab === "standings" && (
           <StandingsTab
             seasonScores={seasonScores}
@@ -560,6 +570,7 @@ function Header({
 }) {
   const navItems = [
     ["picks", "Make Picks"],
+    ["everyone", "Picks by Week"],
     ["standings", "Results"],
   ];
   if (isAdmin) navItems.push(["admin", "Admin"]);
@@ -1322,80 +1333,12 @@ function AdminTab({ config, saveConfig, players, setPlayers, allPicksThisWeek, w
         </label>
       </section>
 
-      {validGames.length > 0 && !isWeekRevealed(config) && (
+      {validGames.length > 0 && (
         <section>
           <p className="text-xs text-slate-500 bg-slate-900 border border-slate-800 rounded-lg px-3 py-3">
-            Picks are hidden — including from this screen — until you lock the week above.
-            {" "}This keeps anyone from picking after seeing everyone else's confidence points.
+            Players can see picks and confidence points on the "Picks by Week" tab — each game reveals for
+            everyone right after that game locks, no need to wait for the whole week.
           </p>
-        </section>
-      )}
-
-      {validGames.length > 0 && isWeekRevealed(config) && (
-        <section>
-          <h2 className="text-xs uppercase tracking-widest text-slate-500 font-mono mb-2">
-            Live scores — Week {week}
-          </h2>
-          <div className="bg-slate-900 border border-slate-800 rounded-lg divide-y divide-slate-800">
-            {players.map((p) => {
-              const submitted = !!allPicksThisWeek[p];
-              const isWinner = weekWinners.includes(p);
-              return (
-                <div key={p} className="flex items-center justify-between px-3 py-2">
-                  <span className={`text-sm ${submitted ? "text-slate-200" : "text-slate-600"}`}>
-                    {p}{!submitted && <span className="text-[10px] ml-2 text-slate-600">no picks submitted</span>}
-                  </span>
-                  <div className="flex items-center gap-2">
-                    <span className="font-mono text-sm text-slate-300">{weekScoresNow[p] || 0}</span>
-                    {isWinner && <span className="text-[10px] bg-amber-400 text-slate-950 font-bold px-1.5 py-0.5 rounded">WIN</span>}
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-          {weekWinners.length > 0 && (
-            <p className="text-xs text-slate-500 mt-2">
-              {weekWinners.length > 1 ? "Tie broken by " : "Winner determined by "}
-              points, then Monday Night tiebreaker (closest to actual without going over).
-            </p>
-          )}
-
-          <h2 className="text-xs uppercase tracking-widest text-slate-500 font-mono mt-6 mb-2">
-            Everyone's picks — Week {week}
-          </h2>
-          <div className="overflow-x-auto bg-slate-900 border border-slate-800 rounded-lg">
-            <table className="w-full text-xs border-collapse">
-              <thead>
-                <tr className="border-b border-slate-800">
-                  <th className="text-left text-slate-500 font-mono font-normal py-2 px-2">Game</th>
-                  {players.map((p) => (
-                    <th key={p} className="text-slate-400 font-mono font-normal py-2 px-1.5 whitespace-nowrap">{p}</th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody>
-                {validGames.map((g) => (
-                  <tr key={g.i} className="border-b border-slate-800/60 last:border-0">
-                    <td className="py-1.5 px-2 font-mono text-slate-400 whitespace-nowrap">{g.away}@{g.home}</td>
-                    {players.map((p) => {
-                      const sel = allPicksThisWeek[p]?.picks?.[g.i];
-                      return (
-                        <td key={p} className="text-center py-1.5 px-1.5 font-mono whitespace-nowrap">
-                          {sel && sel.team ? (
-                            <span className="text-slate-200">
-                              {sel.team}<span className="text-amber-400">·{sel.points}</span>
-                            </span>
-                          ) : (
-                            <span className="text-slate-700">—</span>
-                          )}
-                        </td>
-                      );
-                    })}
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
         </section>
       )}
 
@@ -1453,6 +1396,113 @@ function AdminTab({ config, saveConfig, players, setPlayers, allPicksThisWeek, w
               Save names
             </button>
           </div>
+        )}
+      </section>
+    </div>
+  );
+}
+
+function EveryonePicksTab({ players, config, allPicksThisWeek, week, weekScoresNow, weekWinners }) {
+  const games = config?.games || [];
+  const validGames = games.map((g, i) => ({ ...g, i })).filter((g) => g.away && g.home);
+  const anyLocked = validGames.some((g) => isGameLocked(config, g.i));
+
+  if (validGames.length === 0) {
+    return <p className="text-slate-500 mt-8 text-sm">No games set for Week {week} yet.</p>;
+  }
+
+  if (!anyLocked) {
+    return (
+      <div className="mt-8">
+        <p className="text-xs text-slate-500 bg-slate-900 border border-slate-800 rounded-lg px-3 py-3">
+          Nobody's picks are visible yet for Week {week}. Each game's picks reveal for everyone right after
+          that game locks (kickoff) — you don't have to wait for the whole week.
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="mt-6 space-y-8">
+      <section>
+        <h2 className="text-xs uppercase tracking-widest text-slate-500 font-mono mb-2">
+          Picks — Week {week}
+        </h2>
+        <p className="text-[11px] text-slate-600 mb-2">
+          A game's column fills in for everyone as soon as that game locks — 🔒 means it hasn't kicked off yet.
+        </p>
+        <div className="overflow-x-auto bg-slate-900 border border-slate-800 rounded-lg">
+          <table className="w-full text-xs border-collapse">
+            <thead>
+              <tr className="border-b border-slate-800">
+                <th className="text-left text-slate-500 font-mono font-normal py-2 px-2">Game</th>
+                {players.map((p) => (
+                  <th key={p} className="text-slate-400 font-mono font-normal py-2 px-1.5 whitespace-nowrap">{p}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {validGames.map((g) => {
+                const locked = isGameLocked(config, g.i);
+                return (
+                  <tr key={g.i} className="border-b border-slate-800/60 last:border-0">
+                    <td className="py-1.5 px-2 font-mono text-slate-400 whitespace-nowrap">
+                      {g.away}@{g.home}
+                      {!locked && <span className="text-slate-600 ml-1">🔒</span>}
+                    </td>
+                    {players.map((p) => {
+                      const sel = allPicksThisWeek[p]?.picks?.[g.i];
+                      return (
+                        <td key={p} className="text-center py-1.5 px-1.5 font-mono whitespace-nowrap">
+                          {!locked ? (
+                            <span className="text-slate-700">🔒</span>
+                          ) : sel && sel.team ? (
+                            <span className="text-slate-200">
+                              {sel.team}<span className="text-amber-400">·{sel.points}</span>
+                            </span>
+                          ) : (
+                            <span className="text-slate-700">—</span>
+                          )}
+                        </td>
+                      );
+                    })}
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section>
+        <h2 className="text-xs uppercase tracking-widest text-slate-500 font-mono mb-2">
+          Running scores — Week {week}
+        </h2>
+        <p className="text-[11px] text-slate-600 mb-2">
+          Based on results entered so far — updates as the commissioner marks games final.
+        </p>
+        <div className="bg-slate-900 border border-slate-800 rounded-lg divide-y divide-slate-800">
+          {players.map((p) => {
+            const submitted = !!allPicksThisWeek[p];
+            const isWinner = weekWinners.includes(p);
+            return (
+              <div key={p} className="flex items-center justify-between px-3 py-2">
+                <span className={`text-sm ${submitted ? "text-slate-200" : "text-slate-600"}`}>
+                  {p}{!submitted && <span className="text-[10px] ml-2 text-slate-600">no picks submitted</span>}
+                </span>
+                <div className="flex items-center gap-2">
+                  <span className="font-mono text-sm text-slate-300">{weekScoresNow[p] || 0}</span>
+                  {isWinner && <span className="text-[10px] bg-amber-400 text-slate-950 font-bold px-1.5 py-0.5 rounded">WIN</span>}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+        {weekWinners.length > 0 && (
+          <p className="text-xs text-slate-500 mt-2">
+            {weekWinners.length > 1 ? "Tie broken by " : "Winner determined by "}
+            points, then Monday Night tiebreaker (closest to actual without going over).
+          </p>
         )}
       </section>
     </div>
