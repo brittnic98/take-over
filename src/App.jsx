@@ -1452,12 +1452,20 @@ function EveryonePicksTab({ players, config, allPicksThisWeek, week, weekScoresN
                     </td>
                     {players.map((p) => {
                       const sel = allPicksThisWeek[p]?.picks?.[g.i];
+                      const winner = (config.results || [])[g.i];
+                      const isCorrect = !!(winner && sel && sel.team === winner);
                       return (
                         <td key={p} className="text-center py-1.5 px-1.5 font-mono whitespace-nowrap">
                           {!locked ? (
                             <span className="text-slate-700">🔒</span>
                           ) : sel && sel.team ? (
-                            <span className="text-slate-200">
+                            <span
+                              className={
+                                isCorrect
+                                  ? "text-slate-200 border border-emerald-400 rounded px-1 py-0.5"
+                                  : "text-slate-200"
+                              }
+                            >
                               {sel.team}<span className="text-amber-400">·{sel.points}</span>
                             </span>
                           ) : (
