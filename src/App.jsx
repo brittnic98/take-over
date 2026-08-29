@@ -240,7 +240,12 @@ function computeWeekScores(config, picks, players) {
     pk.picks.forEach((sel, i) => {
       if (!sel || !sel.team) return;
       const winner = results[i];
-      if (winner && sel.team === winner) total += sel.points || 0;
+      if (!winner) return;
+      if (winner === "TIE") {
+        total += (sel.points || 0) / 2;
+      } else if (sel.team === winner) {
+        total += sel.points || 0;
+      }
     });
     scores[p] = total;
   });
@@ -1267,6 +1272,7 @@ function AdminTab({ config, saveConfig, players, setPlayers, allPicksThisWeek, w
                   {[g.away, g.home].filter(Boolean).map((t) => (
                     <option key={t} value={t}>{t}</option>
                   ))}
+                  <option value="TIE">Tie (everyone gets half points)</option>
                 </select>
               )}
             </div>
@@ -1449,11 +1455,15 @@ function EveryonePicksTab({ players, config, allPicksThisWeek, week, weekScoresN
                     <td className="py-1.5 px-2 font-mono text-slate-400 whitespace-nowrap">
                       {g.away}@{g.home}
                       {!locked && <span className="text-slate-600 ml-1">🔒</span>}
+                      {config.results?.[g.i] === "TIE" && (
+                        <span className="text-amber-400 ml-1 text-[10px]">TIE</span>
+                      )}
                     </td>
                     {players.map((p) => {
                       const sel = allPicksThisWeek[p]?.picks?.[g.i];
                       const winner = (config.results || [])[g.i];
-                      const isCorrect = !!(winner && sel && sel.team === winner);
+                      const isTie = winner === "TIE";
+                      const isCorrect = !!(winner && !isTie && sel && sel.team === winner);
                       return (
                         <td key={p} className="text-center py-1.5 px-1.5 font-mono whitespace-nowrap">
                           {!locked ? (
@@ -1463,10 +1473,12 @@ function EveryonePicksTab({ players, config, allPicksThisWeek, week, weekScoresN
                               className={
                                 isCorrect
                                   ? "text-slate-200 border border-emerald-400 rounded px-1 py-0.5"
+                                  : isTie
+                                  ? "text-slate-200 border border-amber-400 rounded px-1 py-0.5"
                                   : "text-slate-200"
                               }
                             >
-                              {sel.team}<span className="text-amber-400">·{sel.points}</span>
+                              {sel.team}<span className="text-amber-400">·{isTie ? (sel.points || 0) / 2 : sel.points}</span>
                             </span>
                           ) : (
                             <span className="text-slate-700">—</span>
