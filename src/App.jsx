@@ -1111,9 +1111,37 @@ function AdminTab({ config, saveConfig, players, setPlayers, allPicksThisWeek, w
 
   const validGames = config.games.map((g, i) => ({ ...g, i })).filter((g) => g.away && g.home);
   const mnfIndices = getMnfIndices(config);
+  const submittedCount = players.filter((p) => !!allPicksThisWeek[p]).length;
 
   return (
     <div className="mt-6 space-y-6">
+      <section>
+        <div className="flex items-center justify-between mb-2">
+          <h2 className="text-xs uppercase tracking-widest text-slate-500 font-mono">
+            Who's submitted — Week {week}
+          </h2>
+          <span className="text-xs font-mono text-slate-500">{submittedCount}/{players.length}</span>
+        </div>
+        <p className="text-[11px] text-slate-600 mb-2">
+          Shows who has saved picks for this week — not what they picked, just whether they've submitted.
+        </p>
+        <div className="bg-slate-900 border border-slate-800 rounded-lg divide-y divide-slate-800">
+          {players.map((p) => {
+            const submitted = !!allPicksThisWeek[p];
+            return (
+              <div key={p} className="flex items-center justify-between px-3 py-2">
+                <span className="text-sm text-slate-200">{p}</span>
+                {submitted ? (
+                  <span className="text-[10px] bg-emerald-400 text-slate-950 font-bold px-1.5 py-0.5 rounded">SUBMITTED</span>
+                ) : (
+                  <span className="text-[10px] bg-slate-700 text-slate-300 font-bold px-1.5 py-0.5 rounded">NOT YET</span>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </section>
+
       <section>
         <div className="mb-3">
           <label className="text-xs font-mono text-slate-500 uppercase block mb-1">
