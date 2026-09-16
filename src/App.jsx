@@ -368,11 +368,12 @@ function FootballPool() {
   }, [players, week, get]);
 
   useEffect(() => {
+    if (tab === "status" && !isAdmin) setTab("picks");
     if (tab === "admin" && !isAdmin) setTab("picks");
   }, [tab, isAdmin]);
 
   useEffect(() => {
-    if (tab === "admin" || tab === "standings" || tab === "everyone") loadAllPicksThisWeek();
+    if (tab === "admin" || tab === "standings" || tab === "everyone" || tab === "status") loadAllPicksThisWeek();
   }, [tab, week, loadAllPicksThisWeek]);
 
   const loadSeason = useCallback(async () => {
@@ -544,6 +545,14 @@ function FootballPool() {
             del={del}
           />
         )}
+        {tab === "status" && (
+          <PickStatusTab
+            players={players}
+            config={config}
+            allPicksThisWeek={allPicksThisWeek}
+            week={week}
+          />
+        )}
         {tab === "everyone" && (
           <EveryonePicksTab
             players={players}
@@ -578,7 +587,10 @@ function Header({
     ["everyone", "Picks by Week"],
     ["standings", "Results"],
   ];
-  if (isAdmin) navItems.push(["admin", "Admin"]);
+  if (isAdmin) {
+    navItems.push(["status", "Pick Status"]);
+    navItems.push(["admin", "Admin"]);
+  }
 
   return (
     <div className="sticky top-0 z-10 bg-slate-950/95 backdrop-blur border-b border-slate-800">
@@ -1111,37 +1123,9 @@ function AdminTab({ config, saveConfig, players, setPlayers, allPicksThisWeek, w
 
   const validGames = config.games.map((g, i) => ({ ...g, i })).filter((g) => g.away && g.home);
   const mnfIndices = getMnfIndices(config);
-  const submittedCount = players.filter((p) => !!allPicksThisWeek[p]).length;
 
   return (
     <div className="mt-6 space-y-6">
-      <section>
-        <div className="flex items-center justify-between mb-2">
-          <h2 className="text-xs uppercase tracking-widest text-slate-500 font-mono">
-            Who's submitted — Week {week}
-          </h2>
-          <span className="text-xs font-mono text-slate-500">{submittedCount}/{players.length}</span>
-        </div>
-        <p className="text-[11px] text-slate-600 mb-2">
-          Shows who has saved picks for this week — not what they picked, just whether they've submitted.
-        </p>
-        <div className="bg-slate-900 border border-slate-800 rounded-lg divide-y divide-slate-800">
-          {players.map((p) => {
-            const submitted = !!allPicksThisWeek[p];
-            return (
-              <div key={p} className="flex items-center justify-between px-3 py-2">
-                <span className="text-sm text-slate-200">{p}</span>
-                {submitted ? (
-                  <span className="text-[10px] bg-emerald-400 text-slate-950 font-bold px-1.5 py-0.5 rounded">SUBMITTED</span>
-                ) : (
-                  <span className="text-[10px] bg-slate-700 text-slate-300 font-bold px-1.5 py-0.5 rounded">NOT YET</span>
-                )}
-              </div>
-            );
-          })}
-        </div>
-      </section>
-
       <section>
         <div className="mb-3">
           <label className="text-xs font-mono text-slate-500 uppercase block mb-1">
@@ -1432,6 +1416,77 @@ function AdminTab({ config, saveConfig, players, setPlayers, allPicksThisWeek, w
           </div>
         )}
       </section>
+    </div>
+  );
+}
+
+function PickStatusTab({ players, config, allPicksThisWeek, week }) {
+  const games = config?.games || [];
+  const validGames = games.map((g, i) => ({ ...g, i })).filter((g) => g.away && g.home);
+
+  if (validGames.length === 0) {
+    return <p className="text-slate-500 mt-8 text-sm">No games set for Week {week} yet.</p>;
+  }
+
+  return (
+    <div className="mt-6 space-y-2">
+      <h2 className="text-xs uppercase tracking-widest text-slate-500 font-mono">
+        Pick status by game — Week {week}
+      </h2>
+      <p className="text-[11px] text-slate-600 mb-2">
+        ✓ means that person has a pick saved for that game. Blank means it's still missing —
+        even if they've submitted picks for other games this week. No teams or points shown here.
+      </p>
+      <div className="overflow-x-auto bg-slate-900 border border-slate-800 rounded-lg">
+        <table className="w-full text-xs border-collapse">
+          <thead>
+            <tr className="border-b border-slate-800">
+              <th className="text-left text-slate-500 font-mono font-normal py-2 px-2">Game</th>
+              {players.map((p) => (
+                <th key={p} className="text-slate-400 font-mono font-normal py-2 px-1.5 whitespace-nowrap">{p}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {validGames.map((g) => (
+              <tr key={g.i} className="border-b border-slate-800/60 last:border-0">
+                <td className="py-1.5 px-2 font-mono text-slate-400 whitespace-nowrap">{g.away}@{g.home}</td>
+                {players.map((p) => {
+                  const sel = allPicksThisWeek[p]?.picks?.[g.i];
+                  const hasPick = !!(sel && sel.team);
+                  return (
+                    <td key={p} className="text-center py-1.5 px-1.5 font-mono">
+                      {hasPick ? (
+                        <span className="text-emerald-400">✓</span>
+                      ) : (
+                        <span className="text-slate-700">—</span>
+                      )}
+                    </td>
+                  );
+                })}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <div className="bg-slate-900 border border-slate-800 rounded-lg divide-y divide-slate-800 mt-4">
+        {players.map((p) => {
+          const pk = allPicksThisWeek[p];
+          const missing = validGames.filter((g) => !(pk?.picks?.[g.i] && pk.picks[g.i].team)).length;
+          return (
+            <div key={p} className="flex items-center justify-between px-3 py-2">
+              <span className="text-sm text-slate-200">{p}</span>
+              {missing === 0 ? (
+                <span className="text-[10px] bg-emerald-400 text-slate-950 font-bold px-1.5 py-0.5 rounded">ALL SET</span>
+              ) : (
+                <span className="text-[10px] bg-amber-400 text-slate-950 font-bold px-1.5 py-0.5 rounded">
+                  MISSING {missing}
+                </span>
+              )}
+            </div>
+          );
+        })}
+      </div>
     </div>
   );
 }
