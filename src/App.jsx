@@ -36,6 +36,10 @@ const DEFAULT_PLAYERS = [
 ];
 
 const TOTAL_WEEKS = 18;
+// A full NFL week with no byes has 16 games. When byes reduce the number of
+// games, confidence points still top out at 16 and just start higher —
+// e.g. 15 games uses 2–16, 14 games uses 3–16 — instead of starting back at 1.
+const MAX_WEEKLY_GAMES = 16;
 const emptyGame = () => ({ away: "", home: "" });
 
 // ---- Storage: shared (Firestore, synced across everyone) vs
@@ -888,7 +892,8 @@ function PicksTab({ players, activePlayer, setActivePlayer, config, myPicks, set
 
   const filledCount = myPicks.picks.filter((s) => s && s.team && s.points).length;
   const validGames = games.filter((g) => g.away && g.home).length;
-  const pointChoices = Array.from({ length: validGames }, (_, i) => i + 1);
+  const pointFloor = Math.max(1, MAX_WEEKLY_GAMES - validGames + 1);
+  const pointChoices = Array.from({ length: validGames }, (_, i) => pointFloor + i);
 
   const availablePointsFor = (i) => {
     const usedElsewhere = new Set(
@@ -931,7 +936,7 @@ function PicksTab({ players, activePlayer, setActivePlayer, config, myPicks, set
 
       {validGames > 0 && !mainLocked && (
         <p className="text-slate-500 text-xs mb-4">
-          {validGames} games this week — use each confidence value from 1–{validGames} exactly once.
+          {validGames} games this week — use each confidence value from {pointFloor}–{pointFloor + validGames - 1} exactly once.
           {" "}
           {DAY_CODES.filter((d) => (config.gameDays || []).includes(d) && config.deadlines?.[d]).map((d) => (
             <span key={d}>{DAY_LABELS[d]} games lock {fmtDeadline(config.deadlines[d])}. </span>
