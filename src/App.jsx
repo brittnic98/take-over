@@ -311,6 +311,8 @@ function FootballPool() {
       if (y) setSeasonYear(y);
       const st = await get("season-type");
       if (st) setSeasonType(st);
+      const cw = await get("current-week");
+      if (cw) setWeek(cw);
       const pin = await get("admin-pin");
       if (pin) setAdminPinState(pin);
       const unlocked = await get("admin-unlocked", false);
@@ -561,6 +563,7 @@ function FootballPool() {
             weekScoresNow={weekScoresNow}
             weekWinners={weekWinners}
             week={week}
+            setDefaultWeek={(w) => set("current-week", w)}
             seasonYear={seasonYear}
             setSeasonYear={(y) => { setSeasonYear(y); set("season-year", y); }}
             seasonType={seasonType}
@@ -1024,7 +1027,7 @@ function PicksTab({ players, activePlayer, setActivePlayer, config, myPicks, set
   );
 }
 
-function AdminTab({ config, saveConfig, players, setPlayers, allPicksThisWeek, weekScoresNow, weekWinners, week, seasonYear, setSeasonYear, seasonType, setSeasonType, clearWeek, get, del }) {
+function AdminTab({ config, saveConfig, players, setPlayers, allPicksThisWeek, weekScoresNow, weekWinners, week, setDefaultWeek, seasonYear, setSeasonYear, seasonType, setSeasonType, clearWeek, get, del }) {
   const [editPlayers, setEditPlayers] = useState(false);
   const [playerText, setPlayerText] = useState(players.join("\n"));
   const [syncStatus, setSyncStatus] = useState("idle");
@@ -1151,6 +1154,20 @@ function AdminTab({ config, saveConfig, players, setPlayers, allPicksThisWeek, w
 
   return (
     <div className="mt-6 space-y-6">
+      <section>
+        <div className="flex items-center justify-between gap-3 bg-slate-900 border border-slate-800 rounded-lg px-3 py-2.5">
+          <p className="text-xs text-slate-400">
+            Everyone's app currently opens to <span className="text-slate-200 font-semibold">Week {week}</span> by default.
+          </p>
+          <button
+            onClick={() => setDefaultWeek(week)}
+            className="shrink-0 bg-sky-500 hover:bg-sky-400 text-slate-950 text-xs font-semibold px-3 py-1.5 rounded"
+          >
+            Set Week {week} as default
+          </button>
+        </div>
+      </section>
+
       <section>
         <div className="mb-3">
           <label className="text-xs font-mono text-slate-500 uppercase block mb-1">
