@@ -117,8 +117,24 @@ function getThuIndices(config) {
   return config.thuIndices;
 }
 
-const DAY_CODES = ["THU", "FRI", "SAT", "SUN", "MON"];
-const DAY_LABELS = { THU: "Thursday", FRI: "Friday", SAT: "Saturday", SUN: "Sunday", MON: "Monday" };
+const DAY_CODES = ["WED", "THU", "FRI", "SAT", "SUN1", "SUN4", "SUNNIGHT", "MON"];
+const DAY_LABELS = {
+  WED: "Wednesday",
+  THU: "Thursday",
+  FRI: "Friday",
+  SAT: "Saturday",
+  SUN1: "Sunday 1:00 PM",
+  SUN4: "Sunday 4:00 PM",
+  SUNNIGHT: "Sunday Night",
+  MON: "Monday",
+  // legacy value from before Sunday was split into slots — kept so old
+  // weeks saved before this change still display a readable label
+  SUN: "Sunday",
+};
+const DAY_SHORT = {
+  WED: "WED", THU: "THU", FRI: "FRI", SAT: "SAT",
+  SUN1: "1PM", SUN4: "4PM", SUNNIGHT: "SNF", MON: "MON", SUN: "SUN",
+};
 const ET_DAY_TO_CODE = { 4: "THU", 5: "FRI", 6: "SAT", 0: "SUN", 1: "MON", 2: "TUE", 3: "WED" };
 
 // Returns the day-of-week code ("THU"/"FRI"/"SAT"/"SUN"/"MON") for a given
@@ -190,10 +206,19 @@ async function fetchWeekFromESPN(week, year, seasonType) {
     } else {
       results.push("");
     }
-    const etDay = new Date(new Date(ev.date).toLocaleString("en-US", { timeZone: "America/New_York" })).getDay();
+    const etDateObj = new Date(new Date(ev.date).toLocaleString("en-US", { timeZone: "America/New_York" }));
+    const etDay = etDateObj.getDay();
+    const etHour = etDateObj.getHours();
     if (etDay === 1) mnfIndices.push(i);
     if (etDay === 4) thuIndices.push(i);
-    gameDays.push(ET_DAY_TO_CODE[etDay] || null);
+    let dayCode = ET_DAY_TO_CODE[etDay] || null;
+    if (etDay === 0) {
+      // Split Sunday into its usual kickoff windows so each can lock separately
+      if (etHour < 15) dayCode = "SUN1";
+      else if (etHour < 19) dayCode = "SUN4";
+      else dayCode = "SUNNIGHT";
+    }
+    gameDays.push(dayCode);
   });
 
   let mnfActual = null;
@@ -926,7 +951,7 @@ function PicksTab({ players, activePlayer, setActivePlayer, config, myPicks, set
                 <span className="text-sm font-mono text-slate-300">{g.away} @ {g.home}</span>
                 <div className="flex items-center gap-2">
                   {isMnf && <span className="text-[10px] uppercase tracking-wide text-amber-400 font-semibold">MNF</span>}
-                  {gameDay && <span className="text-[10px] uppercase tracking-wide text-sky-400 font-semibold">{gameDay}</span>}
+                  {gameDay && <span className="text-[10px] uppercase tracking-wide text-sky-400 font-semibold">{DAY_SHORT[gameDay] || gameDay}</span>}
                   {gameLocked && <span className="text-[10px] uppercase tracking-wide text-slate-500 font-semibold">LOCKED</span>}
                 </div>
               </div>
@@ -1237,8 +1262,9 @@ function AdminTab({ config, saveConfig, players, setPlayers, allPicksThisWeek, w
 
         <h2 className="text-xs uppercase tracking-widest text-slate-500 font-mono mb-2">Week {week}'s games</h2>
         <p className="text-[10px] text-slate-600 mb-2">
-          Set each game's day so you can lock Thursday/Friday/Saturday games earlier than Sunday's.
-          Synced games from ESPN fill this in automatically — double check preseason games since they can fall on unusual days.
+          Set each game's kickoff slot so, for example, Sunday's 1:00, 4:00, and night games can each lock at
+          their own time instead of all locking together. Synced games from ESPN fill this in automatically —
+          double check any unusual kickoff times (international games, holiday games, etc).
         </p>
         <div className="space-y-2">
           {config.games.map((g, i) => (
@@ -1261,10 +1287,13 @@ function AdminTab({ config, saveConfig, players, setPlayers, allPicksThisWeek, w
                 onChange={(e) => setGameDay(i, e.target.value)}
                 className="bg-slate-900 border border-slate-800 rounded px-2 py-1 text-[10px] font-mono text-slate-300"
               >
-                <option value="">day…</option>
+                <option value="">slot…</option>
                 {DAY_CODES.map((d) => (
-                  <option key={d} value={d}>{d}</option>
+                  <option key={d} value={d}>{DAY_LABELS[d]}</option>
                 ))}
+                {getGameDay(config, i) === "SUN" && (
+                  <option value="SUN">Sunday (old, reassign below)</option>
+                )}
               </select>
               <label className="flex items-center gap-1 text-[10px] text-slate-500 ml-1">
                 <input
@@ -1291,9 +1320,15 @@ function AdminTab({ config, saveConfig, players, setPlayers, allPicksThisWeek, w
           ))}
         </div>
 
-        <h2 className="text-xs uppercase tracking-widest text-slate-500 font-mono mt-5 mb-2">Lock deadlines by day</h2>
+        <h2 className="text-xs uppercase tracking-widest text-slate-500 font-mono mt-5 mb-2">Lock deadlines by slot</h2>
+        <p className="text-[11px] text-slate-600 mb-2">
+          Only slots actually used by a game above are shown here. Each locks independently — e.g. Sunday 1:00 PM
+          games can lock at noon while Sunday 4:00 PM games stay open until 3:00.
+        </p>
         <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
-          {DAY_CODES.map((d) => (
+          {[...DAY_CODES, ...((config.gameDays || []).includes("SUN") ? ["SUN"] : [])]
+            .filter((d) => (config.gameDays || []).includes(d))
+            .map((d) => (
             <div key={d}>
               <label className="text-[10px] font-mono text-slate-500 uppercase block mb-1">
                 {DAY_LABELS[d]} games lock at
