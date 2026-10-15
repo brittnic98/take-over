@@ -429,7 +429,47 @@ function FootballPool() {
 
   useEffect(() => { loadMyPicks(); }, [loadMyPicks]);
 
-  const dirty = !!myPicks && savedSnapshot !== null && JSON.stringify(myPicks) !== savedSnapshot;
+  // Plain-English list of what differs from the last saved version
+  const unsavedChanges = useMemo(() => {
+    if (!myPicks || savedSnapshot === null) return [];
+    let saved;
+    try { saved = JSON.parse(savedSnapshot); } catch { return []; }
+    const fmtPick = (s) => {
+      if (!s || (!s.team && !s.points)) return "no pick";
+      return `${s.team || "no team"}${s.points ? ` · ${s.points} pts` : " · no points"}`;
+    };
+    const items = [];
+    ((config && config.games) || []).forEach((g, i) => {
+      if (!g.away || !g.home) return;
+      const before = (saved.picks || [])[i] || {};
+      const after = (myPicks.picks || [])[i] || {};
+      const same =
+        (before.team || "") === (after.team || "") &&
+        (before.points || 0) === (after.points || 0);
+      if (!same) items.push(`${g.away} @ ${g.home}: ${fmtPick(after)} (saved: ${fmtPick(before)})`);
+    });
+    const mnfBefore = String(saved.mnfGuess ?? "");
+    const mnfAfter = String(myPicks.mnfGuess ?? "");
+    if (mnfBefore !== mnfAfter) {
+      items.push(`Monday Night score guess: ${mnfAfter || "empty"} (saved: ${mnfBefore || "empty"})`);
+    }
+    return items;
+  }, [myPicks, savedSnapshot, config]);
+
+  const dirty = unsavedChanges.length > 0;
+
+  // Shown whenever someone tries to leave the picks screen with unsaved changes
+  const confirmLeave = (what, proceed) => {
+    setModal({
+      type: "confirm",
+      title: "You haven't saved your picks!",
+      message: `These changes will be lost if you ${what}:`,
+      items: unsavedChanges,
+      confirmLabel: "Leave without saving",
+      cancelLabel: "Stay and save my picks",
+      onConfirm: () => { setModal(null); proceed(); },
+    });
+  };
 
   useEffect(() => {
     if (!dirty) return;
@@ -439,18 +479,17 @@ function FootballPool() {
   }, [dirty]);
 
   const changeWeek = (w) => {
-    if (dirty) {
-      setModal({
-        type: "confirm",
-        title: "Unsaved picks",
-        message: "You have picks that haven't been saved. If you switch weeks they'll be lost.",
-        confirmLabel: "Switch anyway",
-        cancelLabel: "Stay here",
-        onConfirm: () => { setModal(null); setWeek(w); },
-      });
+    if (dirty) { confirmLeave("switch to a different week", () => setWeek(w)); return; }
+    setWeek(w);
+  };
+
+  // Clicking another tab (Results, Picks by Week, etc.) also leaves the picks screen
+  const changeTab = (t) => {
+    if (dirty && tab === "picks" && t !== "picks") {
+      confirmLeave("leave this screen", () => setTab(t));
       return;
     }
-    setWeek(w);
+    setTab(t);
   };
 
   const loadAllPicksThisWeek = useCallback(async () => {
@@ -641,7 +680,7 @@ function FootballPool() {
         week={week}
         setWeek={changeWeek}
         tab={tab}
-        setTab={setTab}
+        setTab={changeTab}
         isAdmin={isAdmin}
         adminPin={adminPin}
         showPinPrompt={showPinPrompt}
@@ -666,6 +705,7 @@ function FootballPool() {
             saveState={saveState}
             dirty={dirty}
             setModal={setModal}
+            confirmLeave={confirmLeave}
             loadError={loadError}
             onRetry={loadMyPicks}
             week={week}
@@ -977,11 +1017,11 @@ function StatusModal({ modal, onClose }) {
           <div className="mt-5 flex flex-col gap-2">
             {modal.type === "confirm" ? (
               <>
-                <button onClick={modal.onConfirm} className="w-full rounded-lg bg-amber-400 py-3 font-bold text-slate-950">
-                  {modal.confirmLabel || "Continue"}
-                </button>
-                <button onClick={onClose} className="w-full rounded-lg border border-slate-600 py-3 font-semibold text-slate-300">
+                <button onClick={onClose} className="w-full rounded-lg bg-amber-400 py-3 font-bold text-slate-950">
                   {modal.cancelLabel || "Cancel"}
+                </button>
+                <button onClick={modal.onConfirm} className="w-full rounded-lg border border-red-500 py-3 font-semibold text-red-300">
+                  {modal.confirmLabel || "Continue"}
                 </button>
               </>
             ) : (
@@ -1008,7 +1048,7 @@ function StatusModal({ modal, onClose }) {
   );
 }
 
-function PicksTab({ players, activePlayer, setActivePlayer, config, myPicks, setMyPicks, savePicks, saveState, dirty, setModal, loadError, onRetry, week, get, getStrict, set }) {
+function PicksTab({ players, activePlayer, setActivePlayer, config, myPicks, setMyPicks, savePicks, saveState, dirty, setModal, confirmLeave, loadError, onRetry, week, get, getStrict, set }) {
   const [pendingPlayer, setPendingPlayer] = useState(null);
   const [pinMode, setPinMode] = useState(null);
   const [checkingPin, setCheckingPin] = useState(false);
@@ -1130,14 +1170,7 @@ function PicksTab({ players, activePlayer, setActivePlayer, config, myPicks, set
         <button
           onClick={() => {
             if (!dirty) { setActivePlayer(""); return; }
-            setModal({
-              type: "confirm",
-              title: "Unsaved picks",
-              message: "You have picks that haven't been saved. If you switch players they'll be lost.",
-              confirmLabel: "Switch anyway",
-              cancelLabel: "Stay here",
-              onConfirm: () => { setModal(null); setActivePlayer(""); },
-            });
+            confirmLeave("switch players", () => setActivePlayer(""));
           }}
           className="text-xs text-slate-500 hover:text-slate-300"
         >
@@ -1219,7 +1252,7 @@ function PicksTab({ players, activePlayer, setActivePlayer, config, myPicks, set
                     sel.points
                       ? "bg-emerald-500 text-slate-950 border-emerald-500"
                       : needsPoints
-                      ? "bg-red-950/40 border-red-500 text-red-300"
+                      ? "bg-red-200 border-red-500 text-slate-950 font-semibold"
                       : "bg-slate-950 border-slate-800 text-slate-400"
                   }`}
                 >
