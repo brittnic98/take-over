@@ -3,6 +3,7 @@ import React, {
   useEffect,
   useCallback,
   useMemo,
+  useRef,
 } from "react";
 
 import { initializeApp } from "firebase/app";
@@ -59,6 +60,18 @@ function useStorage() {
     }
   }, []);
 
+  // Unlike get(), this tells "nothing saved yet" apart from "couldn't reach the
+  // database", so a failed load is never mistaken for an empty pick sheet.
+  const getStrict = useCallback(async (key) => {
+    if (!db) return { ok: false, value: null };
+    try {
+      const snap = await getDoc(doc(db, "poolData", key));
+      return { ok: true, value: snap.exists() ? JSON.parse(snap.data().value) : null };
+    } catch {
+      return { ok: false, value: null };
+    }
+  }, []);
+
   const set = useCallback(async (key, value, shared = true) => {
     try {
       if (!shared) {
@@ -102,7 +115,7 @@ function useStorage() {
     }
   }, []);
 
-  return { get, set, list, del };
+  return { get, getStrict, set, list, del };
 }
 
 function weekKey(w) { return `week-config:${w}`; }
@@ -282,7 +295,7 @@ function computeWeekScores(config, picks, players) {
 }
 
 function FootballPool() {
-  const { get, set, list, del } = useStorage();
+  const { get, getStrict, set, list, del } = useStorage();
   const [players, setPlayers] = useState(DEFAULT_PLAYERS);
   const [tab, setTab] = useState("picks");
   const [week, setWeek] = useState(1);
@@ -291,6 +304,10 @@ function FootballPool() {
   const [activePlayer, setActivePlayer] = useState("");
   const [myPicks, setMyPicks] = useState(null);
   const [saveState, setSaveState] = useState("idle");
+  const [modal, setModal] = useState(null);
+  const [loadError, setLoadError] = useState(false);
+  const [savedSnapshot, setSavedSnapshot] = useState(null);
+  const loadSeq = useRef(0);
   const [allPicksThisWeek, setAllPicksThisWeek] = useState({});
   const [seasonScores, setSeasonScores] = useState(null);
   const [seasonLoading, setSeasonLoading] = useState(false);
@@ -380,14 +397,61 @@ function FootballPool() {
 
   useEffect(() => { loadWeek(week); }, [week, loadWeek]);
 
+  const closeModal = useCallback(() => setModal(null), []);
+
+  // Loads the active player's picks. A failed read is shown as an error (and
+  // blocks editing) instead of being treated as "no picks yet", so a bad
+  // connection can never lead to real picks being overwritten with blanks.
+  const loadMyPicks = useCallback(async () => {
+    const seq = ++loadSeq.current;
+    setMyPicks(null);
+    setSavedSnapshot(null);
+    setLoadError(false);
+    if (!activePlayer) return;
+    const res = await getStrict(picksKey(week, activePlayer));
+    if (seq !== loadSeq.current) return; // player/week changed while loading
+    if (!res.ok) {
+      setLoadError(true);
+      setModal({
+        type: "error",
+        title: "Couldn't load your picks",
+        message:
+          "Your picks were NOT changed. Check your connection, then tap Try again. Don't make new picks until they load.",
+        actionLabel: "Try again",
+        onAction: () => { setModal(null); loadMyPicks(); },
+      });
+      return;
+    }
+    const loaded = res.value || { picks: [], mnfGuess: "" };
+    setMyPicks(loaded);
+    setSavedSnapshot(JSON.stringify(loaded));
+  }, [activePlayer, week, getStrict]);
+
+  useEffect(() => { loadMyPicks(); }, [loadMyPicks]);
+
+  const dirty = !!myPicks && savedSnapshot !== null && JSON.stringify(myPicks) !== savedSnapshot;
+
   useEffect(() => {
-    if (!activePlayer) { setMyPicks(null); return; }
-    (async () => {
-      const existing = await get(picksKey(week, activePlayer));
-      if (existing) setMyPicks(existing);
-      else setMyPicks({ picks: [], mnfGuess: "" });
-    })();
-  }, [activePlayer, week, get]);
+    if (!dirty) return;
+    const warn = (e) => { e.preventDefault(); e.returnValue = ""; };
+    window.addEventListener("beforeunload", warn);
+    return () => window.removeEventListener("beforeunload", warn);
+  }, [dirty]);
+
+  const changeWeek = (w) => {
+    if (dirty) {
+      setModal({
+        type: "confirm",
+        title: "Unsaved picks",
+        message: "You have picks that haven't been saved. If you switch weeks they'll be lost.",
+        confirmLabel: "Switch anyway",
+        cancelLabel: "Stay here",
+        onConfirm: () => { setModal(null); setWeek(w); },
+      });
+      return;
+    }
+    setWeek(w);
+  };
 
   const loadAllPicksThisWeek = useCallback(async () => {
     const results = {};
@@ -474,10 +538,57 @@ function FootballPool() {
   };
 
   const savePicks = async () => {
+    if (!myPicks || loadError || saveState === "saving") return;
+
+    // A team can't be saved without its confidence points (open games only)
+    const games = (config && config.games) || [];
+    const missingPoints = [];
+    games.forEach((g, i) => {
+      if (!g.away || !g.home || isGameLocked(config, i)) return;
+      const sel = myPicks.picks[i];
+      if (sel && sel.team && !sel.points) missingPoints.push(`${g.away} @ ${g.home}`);
+    });
+    if (missingPoints.length > 0) {
+      setModal({
+        type: "invalid",
+        title: "Confidence points needed",
+        message: "Nothing was saved. Choose confidence points for these games, then save again:",
+        items: missingPoints,
+      });
+      return;
+    }
+
     setSaveState("saving");
-    await set(picksKey(week, activePlayer), myPicks);
-    setSaveState("saved");
-    setTimeout(() => setSaveState("idle"), 1500);
+    setModal({ type: "saving", title: "Saving your picks…" });
+    const key = picksKey(week, activePlayer);
+    const toSave = myPicks;
+    const wrote = await set(key, toSave);
+    // Read it back so "saved" means it's really in the database
+    let verified = false;
+    if (wrote) {
+      const check = await getStrict(key);
+      verified = check.ok && JSON.stringify(check.value) === JSON.stringify(toSave);
+    }
+    setSaveState("idle");
+    if (verified) {
+      setSavedSnapshot(JSON.stringify(toSave));
+      const total = games.filter((g) => g.away && g.home).length;
+      const count = (toSave.picks || []).filter((s) => s && s.team && s.points).length;
+      setModal({
+        type: "success",
+        title: "Picks saved!",
+        message: `${count} of ${total} games saved for ${activePlayer} (Week ${week}).`,
+      });
+    } else {
+      setModal({
+        type: "error",
+        title: "Save FAILED",
+        message:
+          "Your picks were NOT saved. Check your connection and tap Try again. Keep this page open until you see the green \"Picks saved!\" message.",
+        actionLabel: "Try again",
+        onAction: () => { setModal(null); savePicks(); },
+      });
+    }
   };
 
   const weekScoresNow = useMemo(
@@ -525,9 +636,10 @@ function FootballPool() {
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100">
+      <StatusModal modal={modal} onClose={closeModal} />
       <Header
         week={week}
-        setWeek={setWeek}
+        setWeek={changeWeek}
         tab={tab}
         setTab={setTab}
         isAdmin={isAdmin}
@@ -552,8 +664,13 @@ function FootballPool() {
             setMyPicks={setMyPicks}
             savePicks={savePicks}
             saveState={saveState}
+            dirty={dirty}
+            setModal={setModal}
+            loadError={loadError}
+            onRetry={loadMyPicks}
             week={week}
             get={get}
+            getStrict={getStrict}
             set={set}
           />
         )}
@@ -818,7 +935,80 @@ function PlayerPinGate({ player, mode, get, set, onUnlock, onCancel }) {
   );
 }
 
-function PicksTab({ players, activePlayer, setActivePlayer, config, myPicks, setMyPicks, savePicks, saveState, week, get, set }) {
+function StatusModal({ modal, onClose }) {
+  useEffect(() => {
+    if (modal && modal.type === "success") {
+      const t = setTimeout(onClose, 4000);
+      return () => clearTimeout(t);
+    }
+  }, [modal, onClose]);
+
+  if (!modal) return null;
+
+  const themes = {
+    success: { border: "border-emerald-400", circle: "bg-emerald-400 text-slate-950", icon: "✓", title: "text-emerald-300" },
+    error: { border: "border-red-500", circle: "bg-red-500 text-white", icon: "✕", title: "text-red-300" },
+    invalid: { border: "border-amber-400", circle: "bg-amber-400 text-slate-950", icon: "!", title: "text-amber-300" },
+    confirm: { border: "border-amber-400", circle: "bg-amber-400 text-slate-950", icon: "?", title: "text-amber-300" },
+    saving: { border: "border-sky-400", circle: "bg-slate-800", icon: null, title: "text-sky-300" },
+  };
+  const t = themes[modal.type] || themes.invalid;
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/85 p-4"
+      role="alertdialog"
+      aria-modal="true"
+    >
+      <div className={`w-full max-w-sm rounded-2xl border-2 ${t.border} bg-slate-900 p-6 text-center shadow-2xl`}>
+        <div className={`mx-auto mb-4 flex h-24 w-24 items-center justify-center rounded-full text-6xl font-black ${t.circle}`}>
+          {t.icon ? t.icon : <div className="h-12 w-12 animate-spin rounded-full border-4 border-slate-600 border-t-sky-400" />}
+        </div>
+        <h2 className={`text-2xl font-black ${t.title}`}>{modal.title}</h2>
+        {modal.message && <p className="mt-2 text-sm text-slate-300">{modal.message}</p>}
+        {modal.items && modal.items.length > 0 && (
+          <ul className="mt-3 max-h-40 overflow-y-auto rounded-lg bg-slate-950 p-3 text-left text-sm font-mono text-amber-200">
+            {modal.items.map((it) => (
+              <li key={it}>• {it}</li>
+            ))}
+          </ul>
+        )}
+        {modal.type !== "saving" && (
+          <div className="mt-5 flex flex-col gap-2">
+            {modal.type === "confirm" ? (
+              <>
+                <button onClick={modal.onConfirm} className="w-full rounded-lg bg-amber-400 py-3 font-bold text-slate-950">
+                  {modal.confirmLabel || "Continue"}
+                </button>
+                <button onClick={onClose} className="w-full rounded-lg border border-slate-600 py-3 font-semibold text-slate-300">
+                  {modal.cancelLabel || "Cancel"}
+                </button>
+              </>
+            ) : (
+              <>
+                {modal.onAction && (
+                  <button onClick={modal.onAction} className="w-full rounded-lg bg-amber-400 py-3 font-bold text-slate-950">
+                    {modal.actionLabel || "Try again"}
+                  </button>
+                )}
+                <button
+                  onClick={onClose}
+                  className={`w-full rounded-lg py-3 font-bold ${
+                    modal.onAction ? "border border-slate-600 text-slate-300" : "bg-slate-100 text-slate-950"
+                  }`}
+                >
+                  {modal.type === "success" ? "Done" : modal.type === "invalid" ? "Got it" : "Close"}
+                </button>
+              </>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function PicksTab({ players, activePlayer, setActivePlayer, config, myPicks, setMyPicks, savePicks, saveState, dirty, setModal, loadError, onRetry, week, get, getStrict, set }) {
   const [pendingPlayer, setPendingPlayer] = useState(null);
   const [pinMode, setPinMode] = useState(null);
   const [checkingPin, setCheckingPin] = useState(false);
@@ -826,9 +1016,18 @@ function PicksTab({ players, activePlayer, setActivePlayer, config, myPicks, set
   const handleChoosePlayer = async (p) => {
     setPendingPlayer(p);
     setCheckingPin(true);
-    const existing = await get(playerPinKey(p));
+    const res = await getStrict(playerPinKey(p));
     setCheckingPin(false);
-    setPinMode(existing ? "enter" : "create");
+    if (!res.ok) {
+      setPendingPlayer(null);
+      setModal({
+        type: "error",
+        title: "Couldn't reach the database",
+        message: "Check your connection and tap your name again. Nothing was changed.",
+      });
+      return;
+    }
+    setPinMode(res.value ? "enter" : "create");
   };
 
   const cancelPinGate = () => {
@@ -874,7 +1073,20 @@ function PicksTab({ players, activePlayer, setActivePlayer, config, myPicks, set
     );
   }
 
-  if (!myPicks) return <p className="text-slate-500 mt-8">Loading…</p>;
+  if (!myPicks) {
+    if (loadError) {
+      return (
+        <div className="mt-8 rounded-xl border-2 border-red-500 bg-red-950/40 p-5 text-center">
+          <p className="text-lg font-black text-red-300">Couldn't load your picks</p>
+          <p className="mt-1 text-sm text-slate-300">Your saved picks are untouched. Check your connection and try again.</p>
+          <button onClick={onRetry} className="mt-4 w-full rounded-lg bg-amber-400 py-3 font-bold text-slate-950">
+            Try again
+          </button>
+        </div>
+      );
+    }
+    return <p className="text-slate-500 mt-8">Loading…</p>;
+  }
 
   const games = (config && config.games) || [];
   const validGameIndices = games.map((g, i) => (g.away && g.home ? i : null)).filter((i) => i != null);
@@ -892,6 +1104,11 @@ function PicksTab({ players, activePlayer, setActivePlayer, config, myPicks, set
 
   const filledCount = myPicks.picks.filter((s) => s && s.team && s.points).length;
   const validGames = games.filter((g) => g.away && g.home).length;
+  const missingPointsCount = games.filter((g, i) => {
+    if (!g.away || !g.home || isGameLocked(config, i)) return false;
+    const s = myPicks.picks[i];
+    return !!(s && s.team && !s.points);
+  }).length;
   const pointFloor = Math.max(1, MAX_WEEKLY_GAMES - validGames + 1);
   const pointChoices = Array.from({ length: validGames }, (_, i) => pointFloor + i);
 
@@ -910,7 +1127,20 @@ function PicksTab({ players, activePlayer, setActivePlayer, config, myPicks, set
   return (
     <div className="mt-6">
       <div className="flex items-center justify-between mb-4">
-        <button onClick={() => setActivePlayer("")} className="text-xs text-slate-500 hover:text-slate-300">
+        <button
+          onClick={() => {
+            if (!dirty) { setActivePlayer(""); return; }
+            setModal({
+              type: "confirm",
+              title: "Unsaved picks",
+              message: "You have picks that haven't been saved. If you switch players they'll be lost.",
+              confirmLabel: "Switch anyway",
+              cancelLabel: "Stay here",
+              onConfirm: () => { setModal(null); setActivePlayer(""); },
+            });
+          }}
+          className="text-xs text-slate-500 hover:text-slate-300"
+        >
           ← switch player
         </button>
         <span className="font-bold text-amber-400">{activePlayer}</span>
@@ -953,6 +1183,7 @@ function PicksTab({ players, activePlayer, setActivePlayer, config, myPicks, set
           const isMnf = getMnfIndices(config).includes(i);
           const gameDay = getGameDay(config, i);
           const gameLocked = isGameLocked(config, i);
+          const needsPoints = !!sel.team && !sel.points && !gameLocked;
           return (
             <div key={i} className="bg-slate-900 border border-slate-800 rounded-lg p-3">
               <div className="flex items-center justify-between mb-2">
@@ -987,10 +1218,12 @@ function PicksTab({ players, activePlayer, setActivePlayer, config, myPicks, set
                   className={`w-full py-1.5 px-2 rounded text-xs font-mono border transition-colors disabled:opacity-50 ${
                     sel.points
                       ? "bg-emerald-500 text-slate-950 border-emerald-500"
+                      : needsPoints
+                      ? "bg-red-950/40 border-red-500 text-red-300"
                       : "bg-slate-950 border-slate-800 text-slate-400"
                   }`}
                 >
-                  <option value="">confidence points…</option>
+                  <option value="">{needsPoints ? "⚠ choose confidence points (required)" : "confidence points…"}</option>
                   {availablePointsFor(i).map((pt) => (
                     <option key={pt} value={pt}>{pt} point{pt > 1 ? "s" : ""}</option>
                   ))}
@@ -1019,12 +1252,22 @@ function PicksTab({ players, activePlayer, setActivePlayer, config, myPicks, set
 
       {validGames > 0 && (
         <div className="sticky bottom-4 mt-6">
+          {!mainLocked && missingPointsCount > 0 && (
+            <p className="mb-2 text-center text-xs font-semibold text-red-300 bg-red-950/80 border border-red-700 rounded-lg px-3 py-2">
+              {missingPointsCount} pick{missingPointsCount > 1 ? "s" : ""} still need confidence points
+            </p>
+          )}
+          {!mainLocked && dirty && missingPointsCount === 0 && (
+            <p className="mb-2 text-center text-xs font-semibold text-amber-200 bg-amber-950/80 border border-amber-700 rounded-lg px-3 py-2">
+              Unsaved changes — tap Save to keep your picks
+            </p>
+          )}
           <button
             onClick={savePicks}
-            disabled={mainLocked}
+            disabled={mainLocked || saveState === "saving"}
             className="w-full bg-amber-400 disabled:bg-slate-700 disabled:text-slate-400 text-slate-950 font-bold py-3 rounded-lg shadow-lg shadow-amber-950/40 transition-colors"
           >
-            {saveState === "saving" ? "Saving…" : saveState === "saved" ? "Saved ✓" : `Save picks (${filledCount}/${validGames})`}
+            {saveState === "saving" ? "Saving…" : `Save picks (${filledCount}/${validGames})`}
           </button>
         </div>
       )}
