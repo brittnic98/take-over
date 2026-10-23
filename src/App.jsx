@@ -239,6 +239,44 @@ function fmtDeadlineET(iso) {
   return local === et ? `${et} ET` : `${et} ET (${local} your time)`;
 }
 
+// Default lock times (Eastern, on game day) for each kickoff slot. The admin can
+// edit any of these afterwards. Slots not listed here (Wed/Fri/Sat) get no default.
+const DEFAULT_LOCK_TIMES = {
+  THU: "19:15",
+  SUN1: "12:00",
+  SUN4: "15:05",
+  SUNNIGHT: "19:20",
+  MON: "19:15",
+};
+
+// gameDays/gameDates/gameKickoffs are arrays aligned by game index. Returns
+// { slot: isoDeadline }. As a safety net a slot never locks later than one hour
+// before its earliest kickoff, so an unusually early game (e.g. a 9:30 AM London
+// game in the Sunday 1 PM slot, or Thanksgiving) can't be picked after it starts.
+function defaultDeadlinesFor(gameDays, gameDates, gameKickoffs) {
+  const bySlot = {};
+  (gameDays || []).forEach((slot, i) => {
+    if (!DEFAULT_LOCK_TIMES[slot]) return;
+    const date = (gameDates || [])[i];
+    if (!date) return;
+    const ko = (gameKickoffs || [])[i];
+    const cur = bySlot[slot] || { date, kickoff: null };
+    if (date < cur.date) cur.date = date;
+    if (ko && (!cur.kickoff || ko < cur.kickoff)) cur.kickoff = ko;
+    bySlot[slot] = cur;
+  });
+  const out = {};
+  Object.entries(bySlot).forEach(([slot, { date, kickoff }]) => {
+    let iso = etWallToIso(`${date}T${DEFAULT_LOCK_TIMES[slot]}`);
+    if (kickoff) {
+      const cap = new Date(new Date(kickoff).getTime() - 60 * 60 * 1000).toISOString();
+      if (cap < iso) iso = cap;
+    }
+    out[slot] = iso;
+  });
+  return out;
+}
+
 function isWeekRevealed(config) {
   if (!config) return false;
   if (config.locked) return true;
@@ -260,6 +298,8 @@ async function fetchWeekFromESPN(week, year, seasonType) {
   const mnfIndices = [];
   const thuIndices = [];
   const gameDays = [];
+  const gameDates = [];
+  const gameKickoffs = [];
 
   events.forEach((ev, i) => {
     const comp = ev.competitions[0];
@@ -286,6 +326,9 @@ async function fetchWeekFromESPN(week, year, seasonType) {
       else dayCode = "SUNNIGHT";
     }
     gameDays.push(dayCode);
+    const o = etParts(new Date(ev.date).getTime());
+    gameDates.push(`${o.year}-${o.month}-${o.day}`);
+    gameKickoffs.push(new Date(ev.date).toISOString());
   });
 
   let mnfActual = null;
@@ -299,7 +342,7 @@ async function fetchWeekFromESPN(week, year, seasonType) {
     }
   }
 
-  return { games, results, mnfIndices, thuIndices, gameDays, mnfActual };
+  return { games, results, mnfIndices, thuIndices, gameDays, gameDates, gameKickoffs, mnfActual };
 }
 
 function tiebreak(candidates, mnfGuesses, mnfActual) {
@@ -1369,6 +1412,7 @@ function AdminTab({ config, saveConfig, players, setPlayers, allPicksThisWeek, w
   const [confirmClear, setConfirmClear] = useState(false);
   const [playerPinStatus, setPlayerPinStatus] = useState({});
   const [pinResetBusy, setPinResetBusy] = useState(null);
+  const [fillStatus, setFillStatus] = useState(null);
 
   useEffect(() => { setEspnWeek(week); setConfirmClear(false); }, [week]);
 
@@ -1420,7 +1464,11 @@ function AdminTab({ config, saveConfig, players, setPlayers, allPicksThisWeek, w
     setSyncStatus("loading");
     setSyncError(null);
     try {
-      const { games, results, mnfIndices, thuIndices, gameDays, mnfActual } = await fetchWeekFromESPN(espnWeek, seasonYear, seasonType);
+      const espn = await fetchWeekFromESPN(espnWeek, seasonYear, seasonType);
+      const { games, results, mnfIndices, thuIndices, gameDays, mnfActual } = espn;
+      const defaults = defaultDeadlinesFor(gameDays, espn.gameDates, espn.gameKickoffs);
+      const keep = {};
+      Object.entries(config.deadlines || {}).forEach(([k, v]) => { if (v) keep[k] = v; });
       await saveConfig({
         ...config,
         games,
@@ -1428,6 +1476,7 @@ function AdminTab({ config, saveConfig, players, setPlayers, allPicksThisWeek, w
         mnfIndices,
         thuIndices,
         gameDays,
+        deadlines: { ...defaults, ...keep },
         mnfActual: mnfActual ?? config.mnfActual,
       });
       setSyncStatus("done");
@@ -1435,6 +1484,46 @@ function AdminTab({ config, saveConfig, players, setPlayers, allPicksThisWeek, w
     } catch (e) {
       setSyncStatus("error");
       setSyncError(e.message || "Couldn't reach ESPN");
+    }
+  };
+
+  // Fills blank lock times for a week that's already set up, without touching the
+  // games, results, or picks. Only slots with no deadline yet are filled.
+  const handleFillDeadlines = async () => {
+    setFillStatus({ type: "loading" });
+    try {
+      const espn = await fetchWeekFromESPN(espnWeek, seasonYear, seasonType);
+      const used = new Set();
+      const gameDays = [...(config.gameDays || [])];
+      const dates = [];
+      const kickoffs = [];
+      let unmatched = 0;
+      config.games.forEach((g, i) => {
+        if (!g.away || !g.home) return;
+        const j = espn.games.findIndex((e, idx) => !used.has(idx) && e.away === g.away && e.home === g.home);
+        if (j < 0) { unmatched++; return; }
+        used.add(j);
+        dates[i] = espn.gameDates[j];
+        kickoffs[i] = espn.gameKickoffs[j];
+        // fill in a missing slot, or upgrade the old generic "Sunday" tag
+        if (!gameDays[i] || gameDays[i] === "SUN") gameDays[i] = espn.gameDays[j];
+      });
+      const defaults = defaultDeadlinesFor(gameDays, dates, kickoffs);
+      const existing = config.deadlines || {};
+      const deadlines = { ...existing };
+      const filled = [];
+      Object.entries(defaults).forEach(([slot, iso]) => {
+        if (!existing[slot]) { deadlines[slot] = iso; filled.push(DAY_LABELS[slot] || slot); }
+      });
+      await saveConfig({ ...config, gameDays, deadlines });
+      setFillStatus({
+        type: "done",
+        message: filled.length
+          ? `Filled: ${filled.join(", ")}.${unmatched ? ` (${unmatched} game${unmatched > 1 ? "s" : ""} couldn't be matched to ESPN.)` : ""}`
+          : "Nothing to fill — every slot already has a lock time.",
+      });
+    } catch (e) {
+      setFillStatus({ type: "error", message: e.message || "Couldn't reach ESPN" });
     }
   };
 
@@ -1667,6 +1756,24 @@ function AdminTab({ config, saveConfig, players, setPlayers, allPicksThisWeek, w
           Only slots actually used by a game above are shown here. Each locks independently — e.g. Sunday 1:00 PM
           games can lock at noon while Sunday 4:00 PM games stay open until 3:00.
         </p>
+        <div className="flex flex-wrap items-center gap-2 mb-3">
+          <button
+            onClick={handleFillDeadlines}
+            disabled={fillStatus && fillStatus.type === "loading"}
+            className="bg-sky-500 disabled:bg-slate-700 text-slate-950 disabled:text-slate-400 font-bold text-xs px-3 py-1.5 rounded"
+          >
+            {fillStatus && fillStatus.type === "loading" ? "Filling…" : "Fill default lock times"}
+          </button>
+          <span className="text-[10px] text-slate-600">
+            Thu 7:15 PM · Sun 12:00 / 3:05 / 7:20 PM · Mon 7:15 PM (ET, on game day). Only blank slots are filled — edit any time below.
+          </span>
+        </div>
+        {fillStatus && fillStatus.type === "done" && (
+          <p className="text-emerald-400 text-xs mb-3">{fillStatus.message}</p>
+        )}
+        {fillStatus && fillStatus.type === "error" && (
+          <p className="text-red-400 text-xs mb-3">{fillStatus.message}. Set the times by hand below instead.</p>
+        )}
         <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
           {[...DAY_CODES, ...((config.gameDays || []).includes("SUN") ? ["SUN"] : [])]
             .filter((d) => (config.gameDays || []).includes(d))
