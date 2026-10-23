@@ -189,6 +189,56 @@ function isGameLocked(config, i) {
   return new Date() >= new Date(deadline);
 }
 
+// ---- Eastern Time helpers -------------------------------------------------
+// All lock deadlines are entered and shown in Eastern Time (where the NFL
+// schedule lives), no matter what time zone the device is in.
+const ET_ZONE = "America/New_York";
+
+function etParts(ms) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: ET_ZONE,
+    hourCycle: "h23",
+    year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", second: "2-digit",
+  }).formatToParts(new Date(ms));
+  const o = {};
+  parts.forEach((p) => { o[p.type] = p.value; });
+  return o;
+}
+
+// "2026-10-25T12:00" typed as Eastern wall-clock time -> exact ISO instant
+function etWallToIso(value) {
+  if (!value) return null;
+  const m = value.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/);
+  if (!m) return null;
+  const [y, mo, d, h, mi] = m.slice(1).map(Number);
+  const asUtc = Date.UTC(y, mo - 1, d, h, mi);
+  const offsetAt = (ms) => {
+    const o = etParts(ms);
+    return Date.UTC(+o.year, +o.month - 1, +o.day, +o.hour, +o.minute, +o.second) - ms;
+  };
+  let ms = asUtc - offsetAt(asUtc);
+  ms = asUtc - offsetAt(ms); // second pass handles daylight-saving boundaries
+  return new Date(ms).toISOString();
+}
+
+// exact ISO instant -> "2026-10-25T12:00" in Eastern wall-clock time
+function isoToEtWall(iso) {
+  if (!iso) return "";
+  const o = etParts(new Date(iso).getTime());
+  return `${o.year}-${o.month}-${o.day}T${o.hour}:${o.minute}`;
+}
+
+// Friendly label: "Sun 12:00 PM ET" (+ the viewer's own time when it differs)
+function fmtDeadlineET(iso) {
+  if (!iso) return null;
+  const d = new Date(iso);
+  const opts = { weekday: "short", hour: "numeric", minute: "2-digit" };
+  const et = d.toLocaleString("en-US", { ...opts, timeZone: ET_ZONE });
+  const local = d.toLocaleString("en-US", opts);
+  return local === et ? `${et} ET` : `${et} ET (${local} your time)`;
+}
+
 function isWeekRevealed(config) {
   if (!config) return false;
   if (config.locked) return true;
@@ -1161,8 +1211,7 @@ function PicksTab({ players, activePlayer, setActivePlayer, config, myPicks, set
     return pointChoices.filter((pt) => !usedElsewhere.has(pt));
   };
 
-  const fmtDeadline = (iso) =>
-    iso ? new Date(iso).toLocaleString(undefined, { weekday: "short", hour: "numeric", minute: "2-digit" }) : null;
+  const fmtDeadline = fmtDeadlineET;
 
   return (
     <div className="mt-6">
@@ -1423,12 +1472,7 @@ function AdminTab({ config, saveConfig, players, setPlayers, allPicksThisWeek, w
     saveConfig({ ...config, gameDays });
   };
 
-  const toLocalInputValue = (iso) => {
-    if (!iso) return "";
-    const d = new Date(iso);
-    const pad = (n) => String(n).padStart(2, "0");
-    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
-  };
+  const toLocalInputValue = isoToEtWall; // inputs show Eastern Time
 
   const validGames = config.games.map((g, i) => ({ ...g, i })).filter((g) => g.away && g.home);
   const mnfIndices = getMnfIndices(config);
@@ -1629,7 +1673,7 @@ function AdminTab({ config, saveConfig, players, setPlayers, allPicksThisWeek, w
             .map((d) => (
             <div key={d}>
               <label className="text-[10px] font-mono text-slate-500 uppercase block mb-1">
-                {DAY_LABELS[d]} games lock at
+                {DAY_LABELS[d]} games lock at (Eastern)
               </label>
               <input
                 type="datetime-local"
@@ -1639,7 +1683,7 @@ function AdminTab({ config, saveConfig, players, setPlayers, allPicksThisWeek, w
                     ...config,
                     deadlines: {
                       ...(config.deadlines || {}),
-                      [d]: e.target.value ? new Date(e.target.value).toISOString() : null,
+                      [d]: etWallToIso(e.target.value),
                     },
                   })
                 }
@@ -1650,17 +1694,17 @@ function AdminTab({ config, saveConfig, players, setPlayers, allPicksThisWeek, w
         </div>
         <div className="mt-3">
           <label className="text-[10px] font-mono text-slate-500 uppercase block mb-1">
-            Fallback deadline (any game without a day set, or a day left blank above)
+            Fallback deadline, Eastern (any game without a day set, or a day left blank above)
           </label>
           <input
             type="datetime-local"
             value={toLocalInputValue(config.mainDeadline)}
-            onChange={(e) => saveConfig({ ...config, mainDeadline: e.target.value ? new Date(e.target.value).toISOString() : null })}
+            onChange={(e) => saveConfig({ ...config, mainDeadline: etWallToIso(e.target.value) })}
             className="w-full max-w-xs bg-slate-900 border border-slate-700 rounded px-2 py-1.5 text-xs font-mono"
           />
         </div>
         <p className="text-[10px] text-slate-600 mt-1">
-          Each game locks at its own day's deadline; leave a day blank to fall back to the deadline above. All times use your device's local time zone.
+          Each game locks at its own day's deadline; leave a day blank to fall back to the deadline above. All times are Eastern Time (ET) no matter where you are or what your device's time zone is.
         </p>
 
         <div className="flex items-center gap-2 mt-4">
